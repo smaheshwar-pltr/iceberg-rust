@@ -28,8 +28,7 @@ use crate::writer::IcebergWriterBuilder;
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use crate::writer::file_writer::ParquetWriterBuilder;
 use crate::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator, LocationGenerator,
-    ObjectStorageLocationGenerator,
+    DefaultFileNameGenerator, SharedLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 
@@ -44,9 +43,8 @@ use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 /// batch is written, so it is safe to construct one optimistically and only
 /// write to it once a source file is known to have changed.
 ///
-/// The location layout follows `write.object-storage.enabled`: tables that opt
-/// into the object-storage layout get hash-entropy paths from
-/// [`ObjectStorageLocationGenerator`], everything else gets the default layout.
+/// The location layout follows the table's `write.object-storage.enabled`
+/// property; see [`SharedLocationGenerator::for_table`].
 pub(crate) async fn build_replacement_writer(
     table: &Table,
     write_schema: SchemaRef,
@@ -72,27 +70,12 @@ pub(crate) async fn build_replacement_writer(
         parquet_builder = parquet_builder.with_encryption_manager(encryption_manager.clone());
     }
 
-    if table_props.write_object_storage_enabled()? {
-        let location_generator = ObjectStorageLocationGenerator::new(table.metadata())?;
-        build_data_file_writer(table, parquet_builder, location_generator, partition_key).await
-    } else {
-        let location_generator = DefaultLocationGenerator::new(table.metadata())?;
-        build_data_file_writer(table, parquet_builder, location_generator, partition_key).await
-    }
-}
-
-async fn build_data_file_writer<L: LocationGenerator>(
-    table: &Table,
-    parquet_builder: ParquetWriterBuilder,
-    location_generator: L,
-    partition_key: Option<PartitionKey>,
-) -> Result<Box<dyn crate::writer::IcebergWriter>> {
+    let location_generator = SharedLocationGenerator::for_table(table.metadata())?;
     let file_name_generator = DefaultFileNameGenerator::new(
         format!("cow-rewrite-{}", Uuid::now_v7()),
         None,
         DataFileFormat::Parquet,
     );
-    let table_props = table.metadata().table_properties();
     let rolling_builder = RollingFileWriterBuilder::new(
         parquet_builder,
         table_props.write_target_file_size_bytes()?,

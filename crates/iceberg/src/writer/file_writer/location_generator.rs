@@ -17,6 +17,7 @@
 
 //! This module contains the location generator and file name generator for generating path of data file.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -54,6 +55,9 @@ const ENTROPY_DIR_DEPTH: usize = 3;
 #[derive(Clone, Debug)]
 /// `DefaultLocationGenerator` used to generate the data dir location of data file.
 /// The location is generated based on the table location and the data location in table properties.
+///
+/// This generator always uses the default layout. Use [`SharedLocationGenerator::for_table`] to
+/// follow the layout selected by the table's `write.object-storage.enabled` property.
 pub struct DefaultLocationGenerator {
     data_location: String,
 }
@@ -203,6 +207,60 @@ impl LocationGenerator for ObjectStorageLocationGenerator {
     }
 }
 
+/// Object-safe counterpart of [`LocationGenerator`], used by [`SharedLocationGenerator`] to store
+/// a generator behind an `Arc`. `LocationGenerator` itself cannot be a trait object because it
+/// requires `Clone`.
+trait ErasedLocationGenerator: Send + Sync + 'static {
+    fn generate_location(&self, partition_key: Option<&PartitionKey>, file_name: &str) -> String;
+}
+
+impl<T: LocationGenerator> ErasedLocationGenerator for T {
+    fn generate_location(&self, partition_key: Option<&PartitionKey>, file_name: &str) -> String {
+        LocationGenerator::generate_location(self, partition_key, file_name)
+    }
+}
+
+/// A cheaply cloneable handle to a [`LocationGenerator`] chosen at runtime.
+///
+/// Writer builders are generic over their location generator, so a generator picked from
+/// runtime configuration needs a single concrete type. `SharedLocationGenerator` is that type: it
+/// wraps any generator behind an `Arc`, and clones share the wrapped generator.
+#[derive(Clone)]
+pub struct SharedLocationGenerator(Arc<dyn ErasedLocationGenerator>);
+
+impl SharedLocationGenerator {
+    /// Wrap the given location generator.
+    pub fn new(generator: impl LocationGenerator) -> Self {
+        Self(Arc::new(generator))
+    }
+
+    /// Create the location generator for the layout configured on the table.
+    ///
+    /// Uses [`ObjectStorageLocationGenerator`] when `write.object-storage.enabled` is `true`, and
+    /// [`DefaultLocationGenerator`] otherwise.
+    pub fn for_table(table_metadata: &TableMetadata) -> Result<Self> {
+        let properties = table_metadata.table_properties();
+        Ok(if properties.write_object_storage_enabled()? {
+            Self::new(ObjectStorageLocationGenerator::new(table_metadata)?)
+        } else {
+            Self::new(DefaultLocationGenerator::new(table_metadata)?)
+        })
+    }
+}
+
+impl LocationGenerator for SharedLocationGenerator {
+    fn generate_location(&self, partition_key: Option<&PartitionKey>, file_name: &str) -> String {
+        ErasedLocationGenerator::generate_location(self.0.as_ref(), partition_key, file_name)
+    }
+}
+
+impl fmt::Debug for SharedLocationGenerator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedLocationGenerator")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Derive the `{parent}/{name}` context from a table location, mirroring Hadoop's
 /// `Path.getParent().getName()` / `Path.getName()`.
 fn path_context(table_location: &str) -> String {
@@ -294,12 +352,14 @@ pub(crate) mod test {
     use uuid::Uuid;
 
     use super::LocationGenerator;
+    use crate::ErrorKind;
     use crate::spec::{
         FormatVersion, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
         Struct, StructType, TableMetadata, TableProperties, Transform, Type,
     };
     use crate::writer::file_writer::location_generator::{
         DefaultLocationGenerator, FileNameGenerator, ObjectStorageLocationGenerator,
+        SharedLocationGenerator,
     };
 
     #[test]
@@ -607,6 +667,174 @@ pub(crate) mod test {
             location,
             "s3://data.db/table/data_primary/0101/0110/1001/10110010/a"
         );
+    }
+
+    #[test]
+    fn test_shared_location_generator_for_table_default_layout() {
+        let partition_key = identity_partition_key(42);
+        for properties in [
+            HashMap::new(),
+            HashMap::from([(
+                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED.to_string(),
+                "false".to_string(),
+            )]),
+        ] {
+            let table_metadata = table_metadata_with("s3://data.db/table", properties);
+            let location_gen = SharedLocationGenerator::for_table(&table_metadata).unwrap();
+
+            assert_eq!(
+                location_gen.generate_location(None, "a"),
+                "s3://data.db/table/data/a"
+            );
+            assert_eq!(
+                location_gen.generate_location(Some(&partition_key), "a"),
+                "s3://data.db/table/data/id=42/a"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shared_location_generator_for_table_object_storage_layout() {
+        let table_metadata = table_metadata_with(
+            "s3://data.db/table",
+            HashMap::from([(
+                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED.to_string(),
+                "true".to_string(),
+            )]),
+        );
+        let location_gen = SharedLocationGenerator::for_table(&table_metadata).unwrap();
+        let object_storage_gen = ObjectStorageLocationGenerator::new(&table_metadata).unwrap();
+        let partition_key = identity_partition_key(42);
+
+        assert_eq!(
+            location_gen.generate_location(None, "a"),
+            "s3://data.db/table/data/0101/0110/1001/10110010/a"
+        );
+        assert_eq!(
+            location_gen.generate_location(Some(&partition_key), "a"),
+            object_storage_gen.generate_location(Some(&partition_key), "a")
+        );
+    }
+
+    #[test]
+    fn test_shared_location_generator_for_table_exclude_partition_paths() {
+        let table_metadata = table_metadata_with(
+            "s3://data.db/table",
+            HashMap::from([
+                (
+                    TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED.to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS.to_string(),
+                    "false".to_string(),
+                ),
+            ]),
+        );
+        let location_gen = SharedLocationGenerator::for_table(&table_metadata).unwrap();
+        let location =
+            location_gen.generate_location(Some(&identity_partition_key(0)), "test.parquet");
+
+        assert_eq!(
+            location,
+            "s3://data.db/table/data/0110/1010/0011/11101000-test.parquet"
+        );
+    }
+
+    #[test]
+    fn test_shared_location_generator_for_table_data_location_outside_table() {
+        let table_metadata = table_metadata_with(
+            "s3://data.db/table",
+            HashMap::from([
+                (
+                    TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED.to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    TableProperties::PROPERTY_WRITE_DATA_LOCATION.to_string(),
+                    "s3://custom-bucket/objects".to_string(),
+                ),
+            ]),
+        );
+        let location_gen = SharedLocationGenerator::for_table(&table_metadata).unwrap();
+
+        assert_eq!(
+            location_gen.generate_location(None, "a"),
+            "s3://custom-bucket/objects/0101/0110/1001/10110010/data.db/table/a"
+        );
+    }
+
+    #[test]
+    fn test_shared_location_generator_for_table_rejects_invalid_property() {
+        let table_metadata = table_metadata_with(
+            "s3://data.db/table",
+            HashMap::from([(
+                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED.to_string(),
+                "yes".to_string(),
+            )]),
+        );
+        let err = SharedLocationGenerator::for_table(&table_metadata).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[test]
+    fn test_shared_location_generator_wraps_custom_generator() {
+        #[derive(Clone)]
+        struct PrefixLocationGenerator(String);
+
+        impl LocationGenerator for PrefixLocationGenerator {
+            fn generate_location(
+                &self,
+                partition_key: Option<&PartitionKey>,
+                file_name: &str,
+            ) -> String {
+                match partition_key {
+                    Some(partition_key) => {
+                        format!("{}/{}/{}", self.0, partition_key.to_path(), file_name)
+                    }
+                    None => format!("{}/{}", self.0, file_name),
+                }
+            }
+        }
+
+        let location_gen =
+            SharedLocationGenerator::new(PrefixLocationGenerator("mem://custom".to_string()));
+        let cloned = location_gen.clone();
+        let partition_key = identity_partition_key(7);
+
+        assert_eq!(location_gen.generate_location(None, "a"), "mem://custom/a");
+        assert_eq!(
+            location_gen.generate_location(Some(&partition_key), "a"),
+            "mem://custom/id=7/a"
+        );
+        assert_eq!(
+            cloned.generate_location(Some(&partition_key), "a"),
+            location_gen.generate_location(Some(&partition_key), "a")
+        );
+    }
+
+    /// Build a partition key for an identity partition on a single `id` int column.
+    fn identity_partition_key(id: i32) -> PartitionKey {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("id", "id", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        PartitionKey::new(
+            partition_spec,
+            schema,
+            Struct::from_iter([Some(Literal::int(id))]),
+        )
     }
 
     /// Build a minimal `TableMetadata` for location generator tests.
