@@ -51,7 +51,7 @@
 //! use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 //! use iceberg::writer::file_writer::ParquetWriterBuilder;
 //! use iceberg::writer::file_writer::location_generator::{
-//!     DefaultFileNameGenerator, DefaultLocationGenerator,
+//!     DefaultFileNameGenerator, TableLocationGenerator,
 //! };
 //! use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 //! use iceberg::{Catalog, CatalogBuilder, MemoryCatalog, Result, TableIdent};
@@ -78,7 +78,7 @@
 //!     let table = catalog
 //!         .load_table(&TableIdent::from_strs(["hello", "world"])?)
 //!         .await?;
-//!     let location_generator = DefaultLocationGenerator::new(table.metadata()).unwrap();
+//!     let location_generator = TableLocationGenerator::new(table.metadata()).unwrap();
 //!     let file_name_generator = DefaultFileNameGenerator::new(
 //!         "test".to_string(),
 //!         None,
@@ -125,7 +125,7 @@
 //! use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 //! use iceberg::writer::file_writer::ParquetWriterBuilder;
 //! use iceberg::writer::file_writer::location_generator::{
-//!     DefaultFileNameGenerator, DefaultLocationGenerator,
+//!     DefaultFileNameGenerator, TableLocationGenerator,
 //! };
 //! use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 //! use iceberg::{Catalog, CatalogBuilder, MemoryCatalog, Result, TableIdent};
@@ -207,7 +207,7 @@
 //!         table.metadata().current_schema().clone(),
 //!         Struct::from_iter(vec![Some(Literal::string("Seattle"))]),
 //!     );
-//!     let location_generator = DefaultLocationGenerator::new(table.metadata()).unwrap();
+//!     let location_generator = TableLocationGenerator::new(table.metadata()).unwrap();
 //!     let file_name_generator = DefaultFileNameGenerator::new(
 //!         "test".to_string(),
 //!         None,
@@ -262,7 +262,7 @@
 //! # use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 //! # use iceberg::writer::file_writer::ParquetWriterBuilder;
 //! # use iceberg::writer::file_writer::location_generator::{
-//! #     DefaultFileNameGenerator, DefaultLocationGenerator,
+//! #     DefaultFileNameGenerator, TableLocationGenerator,
 //! # };
 //! # use parquet::file::properties::WriterProperties;
 //! # use std::collections::HashMap;
@@ -272,7 +272,7 @@
 //! #     .load("memory", HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), "file:///path/to/warehouse".to_string())]))
 //! #     .await?;
 //! # let table = catalog.load_table(&TableIdent::from_strs(["hello", "world"])?).await?;
-//! # let location_generator = DefaultLocationGenerator::new(table.metadata()).unwrap();
+//! # let location_generator = TableLocationGenerator::new(table.metadata()).unwrap();
 //! # let file_name_generator = DefaultFileNameGenerator::new("test".to_string(), None, iceberg::spec::DataFileFormat::Parquet);
 //! # let parquet_writer_builder = ParquetWriterBuilder::new(WriterProperties::default(), table.metadata().current_schema().clone());
 //! # let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
@@ -326,7 +326,7 @@
 //! # use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 //! # use iceberg::writer::file_writer::ParquetWriterBuilder;
 //! # use iceberg::writer::file_writer::location_generator::{
-//! #     DefaultFileNameGenerator, DefaultLocationGenerator,
+//! #     DefaultFileNameGenerator, TableLocationGenerator,
 //! # };
 //! # use parquet::file::properties::WriterProperties;
 //! # use std::collections::HashMap;
@@ -336,7 +336,7 @@
 //! #     .load("memory", HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), "file:///path/to/warehouse".to_string())]))
 //! #     .await?;
 //! # let table = catalog.load_table(&TableIdent::from_strs(["hello", "world"])?).await?;
-//! # let location_generator = DefaultLocationGenerator::new(table.metadata()).unwrap();
+//! # let location_generator = TableLocationGenerator::new(table.metadata()).unwrap();
 //! # let file_name_generator = DefaultFileNameGenerator::new("test".to_string(), None, iceberg::spec::DataFileFormat::Parquet);
 //! # let parquet_writer_builder = ParquetWriterBuilder::new(WriterProperties::default(), table.metadata().current_schema().clone());
 //! # let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(

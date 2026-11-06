@@ -54,6 +54,9 @@ const ENTROPY_DIR_DEPTH: usize = 3;
 #[derive(Clone, Debug)]
 /// `DefaultLocationGenerator` used to generate the data dir location of data file.
 /// The location is generated based on the table location and the data location in table properties.
+///
+/// It always uses the default layout. Use [`TableLocationGenerator`] to follow the layout selected
+/// by the table properties.
 pub struct DefaultLocationGenerator {
     data_location: String,
 }
@@ -203,6 +206,55 @@ impl LocationGenerator for ObjectStorageLocationGenerator {
     }
 }
 
+/// `TableLocationGenerator` generates data file locations in the layout that the table
+/// properties select.
+///
+/// It uses [`ObjectStorageLocationGenerator`] when
+/// [`write.object-storage.enabled`](crate::spec::TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED)
+/// is `true`, and [`DefaultLocationGenerator`] otherwise. Custom location providers
+/// (`write.location-provider.impl`) are not supported.
+///
+/// Writers that produce data files for a table should use this generator so that the files
+/// follow the table's configured layout.
+#[derive(Clone, Debug)]
+pub struct TableLocationGenerator {
+    inner: Layout,
+}
+
+#[derive(Clone, Debug)]
+enum Layout {
+    Default(DefaultLocationGenerator),
+    ObjectStorage(ObjectStorageLocationGenerator),
+}
+
+impl TableLocationGenerator {
+    /// Create a new `TableLocationGenerator` from table metadata.
+    ///
+    /// Returns an error if a layout-related table property has an invalid value.
+    pub fn new(table_metadata: &TableMetadata) -> Result<Self> {
+        let inner = if table_metadata
+            .table_properties()
+            .write_object_storage_enabled()?
+        {
+            Layout::ObjectStorage(ObjectStorageLocationGenerator::new(table_metadata)?)
+        } else {
+            Layout::Default(DefaultLocationGenerator::new(table_metadata)?)
+        };
+        Ok(Self { inner })
+    }
+}
+
+impl LocationGenerator for TableLocationGenerator {
+    fn generate_location(&self, partition_key: Option<&PartitionKey>, file_name: &str) -> String {
+        match &self.inner {
+            Layout::Default(generator) => generator.generate_location(partition_key, file_name),
+            Layout::ObjectStorage(generator) => {
+                generator.generate_location(partition_key, file_name)
+            }
+        }
+    }
+}
+
 /// Derive the `{parent}/{name}` context from a table location, mirroring Hadoop's
 /// `Path.getParent().getName()` / `Path.getName()`.
 fn path_context(table_location: &str) -> String {
@@ -294,12 +346,14 @@ pub(crate) mod test {
     use uuid::Uuid;
 
     use super::LocationGenerator;
+    use crate::ErrorKind;
     use crate::spec::{
         FormatVersion, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
         Struct, StructType, TableMetadata, TableProperties, Transform, Type,
     };
     use crate::writer::file_writer::location_generator::{
         DefaultLocationGenerator, FileNameGenerator, ObjectStorageLocationGenerator,
+        TableLocationGenerator,
     };
 
     #[test]
@@ -607,6 +661,91 @@ pub(crate) mod test {
             location,
             "s3://data.db/table/data_primary/0101/0110/1001/10110010/a"
         );
+    }
+
+    #[test]
+    fn test_table_location_generator_default_layout() {
+        let enabled = TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED;
+        for properties in [vec![], vec![(enabled, "false")]] {
+            let table_metadata = table_metadata_with_properties(&properties);
+            let expected = DefaultLocationGenerator::new(&table_metadata).unwrap();
+            assert_same_locations(&table_metadata, &expected);
+        }
+    }
+
+    #[test]
+    fn test_table_location_generator_object_storage_layout() {
+        let enabled = TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED;
+        let partitioned_paths = TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS;
+        let cases = [
+            vec![(enabled, "true"), (partitioned_paths, "false")],
+            vec![(enabled, "true")],
+            vec![(enabled, "TRUE")],
+        ];
+        for properties in cases {
+            let table_metadata = table_metadata_with_properties(&properties);
+            let expected = ObjectStorageLocationGenerator::new(&table_metadata).unwrap();
+            assert_same_locations(&table_metadata, &expected);
+        }
+
+        let table_metadata = table_metadata_with_properties(&[(enabled, "true")]);
+        let location_gen = TableLocationGenerator::new(&table_metadata).unwrap();
+        assert_eq!(
+            location_gen.generate_location(None, "a"),
+            "s3://data.db/table/data/0101/0110/1001/10110010/a"
+        );
+    }
+
+    #[test]
+    fn test_table_location_generator_invalid_property() {
+        let table_metadata = table_metadata_with_properties(&[(
+            TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED,
+            "yes",
+        )]);
+        let err = TableLocationGenerator::new(&table_metadata).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    /// Assert that a `TableLocationGenerator` built from `table_metadata` generates the same
+    /// locations as `expected`, with and without a partition key.
+    fn assert_same_locations(table_metadata: &TableMetadata, expected: &impl LocationGenerator) {
+        let location_gen = TableLocationGenerator::new(table_metadata).unwrap();
+        let partition_key = partition_key();
+        for partition_key in [None, Some(&partition_key)] {
+            assert_eq!(
+                location_gen.generate_location(partition_key, "test.parquet"),
+                expected.generate_location(partition_key, "test.parquet")
+            );
+        }
+    }
+
+    /// Build a partition key with an identity partition on `id = 42`.
+    fn partition_key() -> PartitionKey {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("id", "id", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let partition_data = Struct::from_iter([Some(Literal::int(42))]);
+        PartitionKey::new(partition_spec, schema, partition_data)
+    }
+
+    /// Build a minimal `TableMetadata` at `s3://data.db/table` with the given properties.
+    fn table_metadata_with_properties(properties: &[(&str, &str)]) -> TableMetadata {
+        let properties = properties
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        table_metadata_with("s3://data.db/table", properties)
     }
 
     /// Build a minimal `TableMetadata` for location generator tests.
