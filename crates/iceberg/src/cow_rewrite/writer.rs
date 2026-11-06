@@ -27,10 +27,7 @@ use crate::table::Table;
 use crate::writer::IcebergWriterBuilder;
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use crate::writer::file_writer::ParquetWriterBuilder;
-use crate::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, TableLocationGenerator,
-};
-use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
 
 /// Builds a boxed replacement-data-file writer.
 ///
@@ -43,8 +40,9 @@ use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 /// batch is written, so it is safe to construct one optimistically and only
 /// write to it once a source file is known to have changed.
 ///
-/// File locations follow the layout selected by the table properties; see
-/// [`TableLocationGenerator`].
+/// File locations, target file size and parquet settings follow the table
+/// properties; see [`DataFileWriterBuilder::from_table`] and
+/// [`ParquetWriterBuilder::from_table`].
 pub(crate) async fn build_replacement_writer(
     table: &Table,
     write_schema: SchemaRef,
@@ -61,29 +59,16 @@ pub(crate) async fn build_replacement_writer(
             format!("File format {write_format_default} is not supported for COW rewrite yet!"),
         ));
     }
-    let mut parquet_builder =
-        ParquetWriterBuilder::from_table_properties(&table_props, write_schema)?;
-    // Replacement files must not silently downgrade an encrypted table to
-    // plaintext: source rows were read through decryption, so re-encrypt the
-    // rewritten rows when the table carries an encryption manager.
-    if let Some(encryption_manager) = table.encryption_manager() {
-        parquet_builder = parquet_builder.with_encryption_manager(encryption_manager.clone());
-    }
-
-    let location_generator = TableLocationGenerator::new(table.metadata())?;
+    // `from_table` attaches the table's encryption manager, so replacement
+    // files do not silently downgrade an encrypted table to plaintext.
+    let parquet_builder = ParquetWriterBuilder::from_table(table, write_schema)?;
     let file_name_generator = DefaultFileNameGenerator::new(
         format!("cow-rewrite-{}", Uuid::now_v7()),
         None,
         DataFileFormat::Parquet,
     );
-    let rolling_builder = RollingFileWriterBuilder::new(
-        parquet_builder,
-        table_props.write_target_file_size_bytes()?,
-        table.file_io().clone(),
-        location_generator,
-        file_name_generator,
-    );
-    let data_writer_builder = DataFileWriterBuilder::new(rolling_builder);
+    let data_writer_builder =
+        DataFileWriterBuilder::from_table(table, parquet_builder, file_name_generator)?;
     Ok(Box::new(data_writer_builder.build(partition_key).await?))
 }
 

@@ -50,6 +50,7 @@ use crate::spec::{
     SchemaVisitor, Struct, StructType, TableMetadata, TableProperties, Type, VariantType,
     visit_schema,
 };
+use crate::table::Table;
 use crate::transform::create_transform_function;
 use crate::writer::{CurrentFileStatus, DataFile};
 use crate::{Error, ErrorKind, Result};
@@ -67,9 +68,9 @@ impl ParquetWriterBuilder {
     /// Create a new `ParquetWriterBuilder`
     /// To construct the write result, the schema should contain the `PARQUET_FIELD_ID_META_KEY` metadata for each field.
     ///
-    /// When writing into an existing Iceberg table, prefer
-    /// [`Self::from_table_properties`], which derives `WriterProperties` from
-    /// the table's `write.parquet.*` properties.
+    /// When writing into an existing Iceberg table, prefer [`Self::from_table`],
+    /// which derives `WriterProperties` from the table's `write.parquet.*`
+    /// properties and attaches the table's encryption manager.
     pub fn new(props: WriterProperties, schema: SchemaRef) -> Self {
         Self::new_with_match_mode(props, schema, FieldMatchMode::Id)
     }
@@ -91,6 +92,10 @@ impl ParquetWriterBuilder {
     /// Build a `ParquetWriterBuilder` from Iceberg table properties and a
     /// schema, translating `write.parquet.*` settings into `WriterProperties`
     /// instead of using parquet-rs defaults.
+    ///
+    /// This does not attach an [`EncryptionManager`], so files are written in
+    /// plaintext even if the table is encrypted. When writing into a [`Table`],
+    /// use [`Self::from_table`] instead.
     pub fn from_table_properties(
         table_props: &TableProperties<'_>,
         schema: SchemaRef,
@@ -114,6 +119,23 @@ impl ParquetWriterBuilder {
             .set_dictionary_page_size_limit(table_props.parquet_dict_size_bytes()?)
             .build();
         Ok(Self::new_with_match_mode(props, schema, FieldMatchMode::Id))
+    }
+
+    /// Build a `ParquetWriterBuilder` for writing files into `table`.
+    ///
+    /// The writer properties come from the table's `write.parquet.*` properties, as in
+    /// [`Self::from_table_properties`]. If the table has an [`EncryptionManager`], it is attached,
+    /// so files written for an encrypted table are encrypted.
+    ///
+    /// This does not check `write.format.default`. Callers that write in the table's default
+    /// format must check that it is parquet.
+    pub fn from_table(table: &Table, schema: SchemaRef) -> Result<Self> {
+        let mut builder =
+            Self::from_table_properties(&table.metadata().table_properties(), schema)?;
+        if let Some(encryption_manager) = table.encryption_manager() {
+            builder = builder.with_encryption_manager(encryption_manager.clone());
+        }
+        Ok(builder)
     }
 
     /// Set the field match mode used to map Arrow fields to Iceberg fields.
@@ -895,18 +917,18 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::Runtime;
     use crate::arrow::{ArrowReaderBuilder, schema_to_arrow_schema};
     use crate::io::FileIO;
     use crate::scan::{FileScanTask, FileScanTaskStream};
     use crate::spec::decimal_utils::{decimal_mantissa, decimal_new, decimal_scale};
     use crate::spec::geospatial::EdgeInterpolationAlgorithm as IcebergEdgeInterpolationAlgorithm;
     use crate::spec::{PrimitiveLiteral, Struct, *};
-    use crate::test_utils::make_encryption_manager;
+    use crate::test_utils::{make_encrypted_table, make_encryption_manager, test_runtime};
     use crate::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator, FileNameGenerator, LocationGenerator,
     };
     use crate::writer::tests::check_parquet_data_file;
+    use crate::{Runtime, TableIdent};
 
     fn schema_for_all_type() -> Schema {
         Schema::builder()
@@ -3346,6 +3368,84 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.to_string().contains("bogus"));
+    }
+
+    /// Build an unencrypted table with the given properties.
+    fn table_with_properties(properties: &[(&str, &str)]) -> Table {
+        let metadata_json = std::fs::read_to_string(format!(
+            "{}/testdata/table_metadata/TableMetadataV2ValidMinimal.json",
+            env!("CARGO_MANIFEST_DIR"),
+        ))
+        .unwrap();
+        let mut metadata: TableMetadata = serde_json::from_str(&metadata_json).unwrap();
+        metadata.properties.extend(
+            properties
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+        );
+        Table::builder()
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["ns", "plain"]).unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_from_table_uses_table_properties() {
+        let table = table_with_properties(&[
+            (
+                TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES,
+                "1048576",
+            ),
+            (TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC, "gzip"),
+            (TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL, "9"),
+        ]);
+        let builder = ParquetWriterBuilder::from_table(&table, cdc_test_schema()).unwrap();
+
+        assert_eq!(builder.props.max_row_group_bytes(), Some(1048576));
+        assert_eq!(
+            builder.props.compression(&ColumnPath::from("id")),
+            Compression::GZIP(GzipLevel::try_new(9).unwrap())
+        );
+        assert!(builder.encryption_manager.is_none());
+    }
+
+    #[test]
+    fn test_from_table_invalid_property_errors() {
+        let table = table_with_properties(&[(
+            TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC,
+            "bogus",
+        )]);
+        let err = ParquetWriterBuilder::from_table(&table, cdc_test_schema()).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[tokio::test]
+    async fn test_from_table_attaches_encryption_manager() {
+        let table = make_encrypted_table().await;
+        let table_encryption_manager = table.encryption_manager().unwrap();
+
+        let builder = ParquetWriterBuilder::from_table(&table, cdc_test_schema()).unwrap();
+        assert!(Arc::ptr_eq(
+            builder.encryption_manager.as_ref().unwrap(),
+            table_encryption_manager
+        ));
+
+        let output = table
+            .file_io()
+            .new_output("memory:///table/data/encrypted.parquet")
+            .unwrap();
+        let writer = builder.build(output).await.unwrap();
+        assert!(writer.key_metadata.is_some());
+        assert!(
+            writer
+                .writer_properties
+                .file_encryption_properties()
+                .is_some()
+        );
     }
 
     #[test]

@@ -21,8 +21,11 @@ use arrow_array::RecordBatch;
 
 use crate::error::invalid_data;
 use crate::spec::{DataContentType, DataFile, PartitionKey};
+use crate::table::Table;
 use crate::writer::file_writer::FileWriterBuilder;
-use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
+use crate::writer::file_writer::location_generator::{
+    FileNameGenerator, LocationGenerator, TableLocationGenerator,
+};
 use crate::writer::file_writer::rolling_writer::{RollingFileWriter, RollingFileWriterBuilder};
 use crate::writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder};
 use crate::{Error, ErrorKind, Result};
@@ -42,6 +45,39 @@ where
     /// Create a new `DataFileWriterBuilder` using a `RollingFileWriterBuilder`.
     pub fn new(inner: RollingFileWriterBuilder<B, L, F>) -> Self {
         Self { inner }
+    }
+}
+
+impl<B, F> DataFileWriterBuilder<B, TableLocationGenerator, F>
+where
+    B: FileWriterBuilder,
+    F: FileNameGenerator,
+{
+    /// Create a `DataFileWriterBuilder` that writes data files for `table`.
+    ///
+    /// Files are written through the table's [`FileIO`](crate::io::FileIO), rolled over at
+    /// `write.target-file-size-bytes`, and placed in the table's location layout (see
+    /// [`TableLocationGenerator`]).
+    ///
+    /// This constructor does not configure the file format. The file format, its settings and
+    /// encryption all come from `inner_builder`. For parquet, build it with
+    /// [`ParquetWriterBuilder::from_table`], which applies the table's `write.parquet.*`
+    /// properties and encryption manager. A builder from [`ParquetWriterBuilder::new`] or
+    /// [`ParquetWriterBuilder::from_table_properties`] writes plaintext files even if the table
+    /// is encrypted.
+    ///
+    /// [`ParquetWriterBuilder::from_table`]: crate::writer::file_writer::ParquetWriterBuilder::from_table
+    /// [`ParquetWriterBuilder::new`]: crate::writer::file_writer::ParquetWriterBuilder::new
+    /// [`ParquetWriterBuilder::from_table_properties`]: crate::writer::file_writer::ParquetWriterBuilder::from_table_properties
+    pub fn from_table(table: &Table, inner_builder: B, file_name_generator: F) -> Result<Self> {
+        let metadata = table.metadata();
+        Ok(Self::new(RollingFileWriterBuilder::new(
+            inner_builder,
+            metadata.table_properties().write_target_file_size_bytes()?,
+            table.file_io().clone(),
+            TableLocationGenerator::new(metadata)?,
+            file_name_generator,
+        )))
     }
 }
 
@@ -143,11 +179,11 @@ mod test {
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
 
-    use crate::Result;
-    use crate::io::FileIO;
+    use crate::io::{FileIO, LocalFsStorageFactory};
+    use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use crate::spec::{
         DataContentType, DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec,
-        PrimitiveType, Schema, Struct, Type,
+        PrimitiveType, Schema, Struct, TableProperties, Type,
     };
     use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
     use crate::writer::file_writer::ParquetWriterBuilder;
@@ -156,6 +192,7 @@ mod test {
     };
     use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
     use crate::writer::{IcebergWriter, IcebergWriterBuilder, RecordBatch};
+    use crate::{Catalog, CatalogBuilder, NamespaceIdent, Result, TableCreation};
 
     #[tokio::test]
     async fn test_parquet_writer() -> Result<()> {
@@ -319,6 +356,101 @@ mod test {
             .map(|col| col.name())
             .collect();
         assert_eq!(field_names, vec!["id", "name"]);
+
+        Ok(())
+    }
+
+    /// A writer built from a table follows the table's location layout and target file size.
+    #[tokio::test]
+    async fn test_data_file_writer_from_table() -> Result<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse = format!("file://{}", temp_dir.path().join("warehouse").display());
+        let catalog = MemoryCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load(
+                "memory",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse)]),
+            )
+            .await?;
+        let namespace = NamespaceIdent::new("ns".to_string());
+        catalog.create_namespace(&namespace, HashMap::new()).await?;
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::required(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()?;
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("from_table".to_string())
+                    .schema(schema)
+                    .properties(HashMap::from([
+                        (
+                            TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED.to_string(),
+                            "true".to_string(),
+                        ),
+                        (
+                            TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES.to_string(),
+                            "1024".to_string(),
+                        ),
+                    ]))
+                    .build(),
+            )
+            .await?;
+
+        let parquet_writer_builder =
+            ParquetWriterBuilder::from_table(&table, table.metadata().current_schema().clone())?;
+        let file_name_gen =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+        let mut data_file_writer =
+            DataFileWriterBuilder::from_table(&table, parquet_writer_builder, file_name_gen)?
+                .build(None)
+                .await?;
+
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                1.to_string(),
+            )])),
+            Field::new("name", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                2.to_string(),
+            )])),
+        ]));
+        for i in 0..10 {
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+                Arc::new(Int32Array::from_iter_values(i * 100..(i + 1) * 100)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..100).map(|row| format!("name-{row}")),
+                )),
+            ])?;
+            data_file_writer.write(batch).await?;
+        }
+        let data_files = data_file_writer.close().await?;
+
+        // With `write.target-file-size-bytes` at 1 KiB, the writer rolls over many times.
+        assert!(data_files.len() > 4, "{data_files:?}");
+        assert_eq!(data_files.iter().map(|f| f.record_count).sum::<u64>(), 1000);
+        let data_location = format!("{}/data/", table.metadata().location());
+        for data_file in &data_files {
+            // Object storage layout: `{data_location}/{entropy dirs}/{file name}`, where the
+            // entropy dirs are binary strings of 4, 4, 4, and 8 chars.
+            let path = &data_file.file_path;
+            let segments = path
+                .strip_prefix(&data_location)
+                .unwrap_or_else(|| panic!("expected {path} under {data_location}"))
+                .split('/')
+                .collect::<Vec<_>>();
+            assert_eq!(segments.len(), 5, "{path}");
+            for (segment, len) in segments[..4].iter().zip([4, 4, 4, 8]) {
+                assert_eq!(segment.len(), len, "{path}");
+                assert!(segment.chars().all(|c| c == '0' || c == '1'), "{path}");
+            }
+            assert!(segments[4].starts_with("test-"), "{path}");
+            assert!(table.file_io().exists(path).await?, "{path}");
+        }
 
         Ok(())
     }
