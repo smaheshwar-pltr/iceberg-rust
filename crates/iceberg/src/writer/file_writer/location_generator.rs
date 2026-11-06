@@ -55,8 +55,9 @@ const ENTROPY_DIR_DEPTH: usize = 3;
 /// `DefaultLocationGenerator` used to generate the data dir location of data file.
 /// The location is generated based on the table location and the data location in table properties.
 ///
-/// It always uses the default layout. Use [`TableLocationGenerator`] to follow the layout selected
-/// by the table properties.
+/// "Default" names the layout, not the table's choice: this generator always writes
+/// `{data location}/{partition path}/{file name}` and ignores `write.object-storage.enabled`.
+/// Use [`TableLocationGenerator`] to follow the layout selected by the table properties.
 pub struct DefaultLocationGenerator {
     data_location: String,
 }
