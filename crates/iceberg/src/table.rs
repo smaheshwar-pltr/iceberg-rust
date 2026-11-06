@@ -31,6 +31,10 @@ use crate::scan::TableScanBuilder;
 use crate::spec::{
     ManifestListReader, ManifestReader, SchemaRef, SnapshotRef, TableMetadata, TableMetadataRef,
 };
+use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use crate::writer::file_writer::location_generator::{FileNameGenerator, TableLocationGenerator};
+use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use crate::writer::file_writer::{FileWriterBuilder, ParquetWriterBuilder};
 use crate::{Result, TableIdent};
 
 /// Builder to create table scan.
@@ -325,6 +329,54 @@ impl Table {
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
         ArrowReaderBuilder::new(self.file_io.clone(), self.runtime().clone())
     }
+
+    /// Creates a [`ParquetWriterBuilder`] for writing files into this table.
+    ///
+    /// The writer properties come from the table's `write.parquet.*` properties, as in
+    /// [`ParquetWriterBuilder::from_table_properties`]. If the table has an
+    /// [`EncryptionManager`], it is attached, so files written for an encrypted table are
+    /// encrypted.
+    ///
+    /// This does not check `write.format.default`. Callers that write in the table's default
+    /// format must check that it is parquet.
+    pub fn parquet_writer_builder(&self, schema: SchemaRef) -> Result<ParquetWriterBuilder> {
+        let mut builder =
+            ParquetWriterBuilder::from_table_properties(&self.metadata.table_properties(), schema)?;
+        if let Some(encryption_manager) = &self.encryption_manager {
+            builder = builder.with_encryption_manager(encryption_manager.clone());
+        }
+        Ok(builder)
+    }
+
+    /// Creates a [`DataFileWriterBuilder`] for writing data files into this table.
+    ///
+    /// Files are written through the table's [`FileIO`], rolled over at
+    /// `write.target-file-size-bytes`, and placed in the table's location layout (see
+    /// [`TableLocationGenerator`]).
+    ///
+    /// This does not configure the file format. The file format, its settings and encryption
+    /// all come from `inner_builder`. For parquet, build it with
+    /// [`Self::parquet_writer_builder`]. A builder from [`ParquetWriterBuilder::new`] or
+    /// [`ParquetWriterBuilder::from_table_properties`] writes plaintext files even if the table
+    /// is encrypted.
+    pub fn data_file_writer_builder<B, F>(
+        &self,
+        inner_builder: B,
+        file_name_generator: F,
+    ) -> Result<DataFileWriterBuilder<B, TableLocationGenerator, F>>
+    where
+        B: FileWriterBuilder,
+        F: FileNameGenerator,
+    {
+        let table_props = self.metadata.table_properties();
+        Ok(DataFileWriterBuilder::new(RollingFileWriterBuilder::new(
+            inner_builder,
+            table_props.write_target_file_size_bytes()?,
+            self.file_io.clone(),
+            TableLocationGenerator::new(&self.metadata)?,
+            file_name_generator,
+        )))
+    }
 }
 
 /// `StaticTable` is a read-only table struct that can be created from a metadata file or from `TableMetaData` without a catalog.
@@ -417,11 +469,22 @@ impl StaticTable {
 mod tests {
     use std::fs;
 
+    use arrow_array::{Int64Array, RecordBatch};
+    use bytes::Bytes;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::basic::Compression;
+
     use super::*;
     use crate::ErrorKind;
+    use crate::arrow::schema_to_arrow_schema;
     use crate::encryption::SensitiveBytes;
     use crate::encryption::kms::MemoryKeyManagementClient;
-    use crate::spec::TableProperties;
+    use crate::spec::{DataFile, DataFileFormat, TableProperties};
+    use crate::test_utils::make_encrypted_table;
+    use crate::writer::file_writer::location_generator::{
+        DefaultFileNameGenerator, LocationGenerator, ObjectStorageLocationGenerator,
+    };
+    use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
     fn load_test_metadata(filename: &str) -> TableMetadata {
         let path = format!(
@@ -632,5 +695,118 @@ mod tests {
             .build()
             .unwrap();
         assert!(table.encryption_manager().is_none());
+    }
+
+    /// A table at `memory:///table` with an unpartitioned `x: long` schema, no encryption and the
+    /// given properties.
+    fn memory_table(properties: &[(&str, &str)]) -> Table {
+        let mut metadata: TableMetadata = load_test_metadata("TableMetadataV3ValidEncryption.json");
+        metadata.properties = properties
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        Table::builder()
+            .file_io(FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["ns", "plain"]).unwrap())
+            .runtime(Runtime::try_current().unwrap())
+            .build()
+            .unwrap()
+    }
+
+    /// Writes `num_batches` batches of 100 rows through the table's writer builders.
+    async fn write_with_table_builders(table: &Table, num_batches: i64) -> Vec<DataFile> {
+        let schema = table.current_schema_ref();
+        let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let parquet_writer_builder = table.parquet_writer_builder(schema).unwrap();
+        let file_name_generator =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
+        let mut writer = table
+            .data_file_writer_builder(parquet_writer_builder, file_name_generator)
+            .unwrap()
+            .build(None)
+            .await
+            .unwrap();
+        for i in 0..num_batches {
+            let column = Int64Array::from_iter_values(i * 100..(i + 1) * 100);
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(column)]).unwrap();
+            writer.write(batch).await.unwrap();
+        }
+        writer.close().await.unwrap()
+    }
+
+    async fn read_file(table: &Table, data_file: &DataFile) -> Bytes {
+        let input = table.file_io().new_input(data_file.file_path()).unwrap();
+        input.read().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn parquet_writer_builder_applies_write_parquet_properties() {
+        let table = memory_table(&[(TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC, "gzip")]);
+
+        let data_files = write_with_table_builders(&table, 1).await;
+
+        assert_eq!(data_files.len(), 1);
+        assert!(data_files[0].key_metadata().is_none());
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(read_file(&table, &data_files[0]).await)
+                .unwrap();
+        let compression = reader.metadata().row_group(0).column(0).compression();
+        assert!(
+            matches!(compression, Compression::GZIP(_)),
+            "{compression:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parquet_writer_builder_rejects_invalid_write_parquet_property() {
+        let table = memory_table(&[(TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC, "bogus")]);
+
+        let err = table
+            .parquet_writer_builder(table.current_schema_ref())
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[tokio::test]
+    async fn parquet_writer_builder_encrypts_files_for_encrypted_table() {
+        let table = make_encrypted_table().await;
+
+        let data_files = write_with_table_builders(&table, 1).await;
+
+        assert_eq!(data_files.len(), 1);
+        assert!(data_files[0].key_metadata().is_some());
+        // A reader without the table's keys cannot read the file.
+        let plaintext_read =
+            ParquetRecordBatchReaderBuilder::try_new(read_file(&table, &data_files[0]).await)
+                .and_then(|builder| builder.build())
+                .map(|reader| reader.collect::<std::result::Result<Vec<_>, _>>());
+        assert!(!matches!(plaintext_read, Ok(Ok(_))));
+    }
+
+    #[tokio::test]
+    async fn data_file_writer_builder_follows_table_layout_and_target_file_size() {
+        let table = memory_table(&[
+            (
+                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED,
+                "true",
+            ),
+            (TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES, "1"),
+        ]);
+
+        let data_files = write_with_table_builders(&table, 3).await;
+
+        // With the default target file size, all rows would go to one file.
+        assert!(data_files.len() > 1, "{data_files:?}");
+        let record_count: u64 = data_files.iter().map(DataFile::record_count).sum();
+        assert_eq!(record_count, 300);
+        let object_storage = ObjectStorageLocationGenerator::new(table.metadata()).unwrap();
+        for data_file in &data_files {
+            let path = data_file.file_path();
+            let file_name = path.rsplit('/').next().unwrap();
+            assert_eq!(path, object_storage.generate_location(None, file_name));
+            assert!(table.file_io().exists(path).await.unwrap(), "{path}");
+        }
     }
 }

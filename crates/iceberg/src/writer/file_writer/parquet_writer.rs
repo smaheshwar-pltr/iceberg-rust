@@ -68,8 +68,11 @@ impl ParquetWriterBuilder {
     /// To construct the write result, the schema should contain the `PARQUET_FIELD_ID_META_KEY` metadata for each field.
     ///
     /// When writing into an existing Iceberg table, prefer
-    /// [`Self::from_table_properties`], which derives `WriterProperties` from
-    /// the table's `write.parquet.*` properties.
+    /// [`Table::parquet_writer_builder`], which derives `WriterProperties` from
+    /// the table's `write.parquet.*` properties and attaches the table's
+    /// encryption manager.
+    ///
+    /// [`Table::parquet_writer_builder`]: crate::table::Table::parquet_writer_builder
     pub fn new(props: WriterProperties, schema: SchemaRef) -> Self {
         Self::new_with_match_mode(props, schema, FieldMatchMode::Id)
     }
@@ -91,6 +94,12 @@ impl ParquetWriterBuilder {
     /// Build a `ParquetWriterBuilder` from Iceberg table properties and a
     /// schema, translating `write.parquet.*` settings into `WriterProperties`
     /// instead of using parquet-rs defaults.
+    ///
+    /// This does not attach an [`EncryptionManager`], so files are written in
+    /// plaintext even if the table is encrypted. When writing into a table, use
+    /// [`Table::parquet_writer_builder`] instead.
+    ///
+    /// [`Table::parquet_writer_builder`]: crate::table::Table::parquet_writer_builder
     pub fn from_table_properties(
         table_props: &TableProperties<'_>,
         schema: SchemaRef,

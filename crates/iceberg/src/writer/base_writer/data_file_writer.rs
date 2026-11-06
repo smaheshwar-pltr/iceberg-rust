@@ -40,6 +40,11 @@ where
     F: FileNameGenerator,
 {
     /// Create a new `DataFileWriterBuilder` using a `RollingFileWriterBuilder`.
+    ///
+    /// To write data files for a table, prefer [`Table::data_file_writer_builder`], which
+    /// takes the file IO, target file size and location layout from the table.
+    ///
+    /// [`Table::data_file_writer_builder`]: crate::table::Table::data_file_writer_builder
     pub fn new(inner: RollingFileWriterBuilder<B, L, F>) -> Self {
         Self { inner }
     }

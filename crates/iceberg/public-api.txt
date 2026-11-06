@@ -3399,6 +3399,7 @@ pub struct iceberg::table::Table
 impl iceberg::table::Table
 pub fn iceberg::table::Table::builder() -> iceberg::table::TableBuilder
 pub fn iceberg::table::Table::current_schema_ref(&self) -> iceberg::spec::SchemaRef
+pub fn iceberg::table::Table::data_file_writer_builder<B, F>(&self, inner_builder: B, file_name_generator: F) -> iceberg::Result<iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder<B, iceberg::writer::file_writer::location_generator::TableLocationGenerator, F>> where B: iceberg::writer::file_writer::FileWriterBuilder, F: iceberg::writer::file_writer::location_generator::FileNameGenerator
 pub fn iceberg::table::Table::encryption_manager(&self) -> core::option::Option<&alloc::sync::Arc<iceberg::encryption::EncryptionManager>>
 pub fn iceberg::table::Table::file_io(&self) -> &iceberg::io::FileIO
 pub fn iceberg::table::Table::identifier(&self) -> &iceberg::TableIdent
@@ -3409,6 +3410,7 @@ pub fn iceberg::table::Table::metadata(&self) -> &iceberg::spec::TableMetadata
 pub fn iceberg::table::Table::metadata_location(&self) -> core::option::Option<&str>
 pub fn iceberg::table::Table::metadata_location_result(&self) -> iceberg::Result<&str>
 pub fn iceberg::table::Table::metadata_ref(&self) -> iceberg::spec::TableMetadataRef
+pub fn iceberg::table::Table::parquet_writer_builder(&self, schema: iceberg::spec::SchemaRef) -> iceberg::Result<iceberg::writer::file_writer::ParquetWriterBuilder>
 pub fn iceberg::table::Table::reader_builder(&self) -> iceberg::arrow::ArrowReaderBuilder
 pub fn iceberg::table::Table::readonly(&self) -> bool
 pub fn iceberg::table::Table::scan(&self) -> iceberg::scan::TableScanBuilder<'_>

@@ -48,21 +48,13 @@
 //! use iceberg::io::{FileIO, FileIOBuilder};
 //! use iceberg::spec::DataFile;
 //! use iceberg::transaction::Transaction;
-//! use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-//! use iceberg::writer::file_writer::ParquetWriterBuilder;
-//! use iceberg::writer::file_writer::location_generator::{
-//!     DefaultFileNameGenerator, TableLocationGenerator,
-//! };
+//! use iceberg::writer::file_writer::location_generator::DefaultFileNameGenerator;
 //! use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 //! use iceberg::{Catalog, CatalogBuilder, MemoryCatalog, Result, TableIdent};
-//! use parquet::file::properties::WriterProperties;
 //! #[tokio::main]
 //! async fn main() -> Result<()> {
 //!     // Connect to a catalog.
 //!     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-//!     use iceberg::writer::file_writer::rolling_writer::{
-//!         RollingFileWriter, RollingFileWriterBuilder,
-//!     };
 //!     let catalog = MemoryCatalogBuilder::default()
 //!         .load(
 //!             "memory",
@@ -78,29 +70,20 @@
 //!     let table = catalog
 //!         .load_table(&TableIdent::from_strs(["hello", "world"])?)
 //!         .await?;
-//!     let location_generator = TableLocationGenerator::new(table.metadata()).unwrap();
 //!     let file_name_generator = DefaultFileNameGenerator::new(
 //!         "test".to_string(),
 //!         None,
 //!         iceberg::spec::DataFileFormat::Parquet,
 //!     );
 //!
-//!     // Create a parquet file writer builder. The parameter can get from table.
-//!     let parquet_writer_builder = ParquetWriterBuilder::new(
-//!         WriterProperties::default(),
-//!         table.metadata().current_schema().clone(),
-//!     );
+//!     // Create a parquet file writer builder from the table's parquet settings and
+//!     // encryption manager.
+//!     let parquet_writer_builder = table.parquet_writer_builder(table.current_schema_ref())?;
 //!
-//!     // Create a rolling file writer using parquet file writer builder.
-//!     let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-//!         parquet_writer_builder,
-//!         table.file_io().clone(),
-//!         location_generator.clone(),
-//!         file_name_generator.clone(),
-//!     );
-//!
-//!     // Create a data file writer using parquet file writer builder.
-//!     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
+//!     // Create a data file writer builder that writes files for the table: through its
+//!     // file IO, in its location layout, and rolling over at its target file size.
+//!     let data_file_writer_builder =
+//!         table.data_file_writer_builder(parquet_writer_builder, file_name_generator)?;
 //!     // Build the data file writer
 //!     let mut data_file_writer = data_file_writer_builder.build(None).await?;
 //!
@@ -257,14 +240,8 @@
 //! ```rust, no_run
 //! # // Same setup as the simple example above...
 //! # use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-//! # use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 //! # use iceberg::{Catalog, CatalogBuilder, Result, TableIdent};
-//! # use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-//! # use iceberg::writer::file_writer::ParquetWriterBuilder;
-//! # use iceberg::writer::file_writer::location_generator::{
-//! #     DefaultFileNameGenerator, TableLocationGenerator,
-//! # };
-//! # use parquet::file::properties::WriterProperties;
+//! # use iceberg::writer::file_writer::location_generator::DefaultFileNameGenerator;
 //! # use std::collections::HashMap;
 //! # #[tokio::main]
 //! # async fn main() -> Result<()> {
@@ -272,12 +249,9 @@
 //! #     .load("memory", HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), "file:///path/to/warehouse".to_string())]))
 //! #     .await?;
 //! # let table = catalog.load_table(&TableIdent::from_strs(["hello", "world"])?).await?;
-//! # let location_generator = TableLocationGenerator::new(table.metadata()).unwrap();
 //! # let file_name_generator = DefaultFileNameGenerator::new("test".to_string(), None, iceberg::spec::DataFileFormat::Parquet);
-//! # let parquet_writer_builder = ParquetWriterBuilder::new(WriterProperties::default(), table.metadata().current_schema().clone());
-//! # let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-//! #     parquet_writer_builder, table.file_io().clone(), location_generator, file_name_generator);
-//! # let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+//! # let parquet_writer_builder = table.parquet_writer_builder(table.current_schema_ref())?;
+//! # let data_file_writer_builder = table.data_file_writer_builder(parquet_writer_builder, file_name_generator)?;
 //!
 //! // Wrap the data file writer with FanoutWriter for partitioning
 //! use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
@@ -321,14 +295,8 @@
 //! ```rust, no_run
 //! # // Same setup as the simple example above...
 //! # use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-//! # use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 //! # use iceberg::{Catalog, CatalogBuilder, Result, TableIdent};
-//! # use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-//! # use iceberg::writer::file_writer::ParquetWriterBuilder;
-//! # use iceberg::writer::file_writer::location_generator::{
-//! #     DefaultFileNameGenerator, TableLocationGenerator,
-//! # };
-//! # use parquet::file::properties::WriterProperties;
+//! # use iceberg::writer::file_writer::location_generator::DefaultFileNameGenerator;
 //! # use std::collections::HashMap;
 //! # #[tokio::main]
 //! # async fn main() -> Result<()> {
@@ -336,12 +304,9 @@
 //! #     .load("memory", HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), "file:///path/to/warehouse".to_string())]))
 //! #     .await?;
 //! # let table = catalog.load_table(&TableIdent::from_strs(["hello", "world"])?).await?;
-//! # let location_generator = TableLocationGenerator::new(table.metadata()).unwrap();
 //! # let file_name_generator = DefaultFileNameGenerator::new("test".to_string(), None, iceberg::spec::DataFileFormat::Parquet);
-//! # let parquet_writer_builder = ParquetWriterBuilder::new(WriterProperties::default(), table.metadata().current_schema().clone());
-//! # let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-//! #     parquet_writer_builder, table.file_io().clone(), location_generator, file_name_generator);
-//! # let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+//! # let parquet_writer_builder = table.parquet_writer_builder(table.current_schema_ref())?;
+//! # let data_file_writer_builder = table.data_file_writer_builder(parquet_writer_builder, file_name_generator)?;
 //!
 //! // Wrap the data file writer with ClusteredWriter for sorted partitioning
 //! use iceberg::writer::partitioning::clustered_writer::ClusteredWriter;
