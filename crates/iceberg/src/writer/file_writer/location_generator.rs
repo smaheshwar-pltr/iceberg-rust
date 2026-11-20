@@ -17,12 +17,13 @@
 
 //! This module contains the location generator and file name generator for generating path of data file.
 
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use crate::Result;
 use crate::spec::{DataFileFormat, PartitionKey, TableMetadata};
 use crate::util::location::strip_trailing_slash;
+use crate::{Result, TableIdent};
 
 /// `LocationGenerator` used to generate the location of data file.
 pub trait LocationGenerator: Send + Sync + 'static {
@@ -58,7 +59,7 @@ const ENTROPY_DIR_DEPTH: usize = 3;
 /// Paths use `{data location}/{partition path}/{file name}`, omitting the
 /// partition path for unpartitioned files. It ignores `write.object-storage.enabled`; use
 /// [`Table::location_generator`](crate::table::Table::location_generator) for the layout the
-/// table properties select.
+/// table is configured with.
 pub struct DefaultLocationGenerator {
     data_location: String,
 }
@@ -208,19 +209,75 @@ impl LocationGenerator for ObjectStorageLocationGenerator {
     }
 }
 
-/// Creates the generator for the layout selected by the table properties.
-pub(crate) fn table_location_generator(
-    table_metadata: &TableMetadata,
-) -> Result<Arc<dyn LocationGenerator>> {
-    if table_metadata
-        .table_properties()
-        .write_object_storage_enabled()?
-    {
-        Ok(Arc::new(ObjectStorageLocationGenerator::new(
-            table_metadata,
-        )?))
-    } else {
-        Ok(Arc::new(DefaultLocationGenerator::new(table_metadata)?))
+/// The table a [`LocationGeneratorFactory`] creates a location generator for.
+#[derive(Debug)]
+pub struct LocationGeneratorContext<'a> {
+    metadata: &'a TableMetadata,
+    identifier: &'a TableIdent,
+}
+
+impl<'a> LocationGeneratorContext<'a> {
+    pub(crate) fn new(metadata: &'a TableMetadata, identifier: &'a TableIdent) -> Self {
+        Self {
+            metadata,
+            identifier,
+        }
+    }
+
+    /// Returns the table's current metadata.
+    pub fn metadata(&self) -> &'a TableMetadata {
+        self.metadata
+    }
+
+    /// Returns the table's identifier.
+    pub fn identifier(&self) -> &'a TableIdent {
+        self.identifier
+    }
+}
+
+/// Creates the [`LocationGenerator`] for a table.
+///
+/// Set one with
+/// [`TableBuilder::location_generator_factory`](crate::table::TableBuilder::location_generator_factory).
+/// Each call to [`Table::location_generator`](crate::table::Table::location_generator) calls the
+/// table's factory with the table's current metadata. A factory that customizes only some tables
+/// can delegate the others to [`ResolvingLocationGeneratorFactory`].
+pub trait LocationGeneratorFactory: Debug + Send + Sync {
+    /// Creates a location generator for the table in `context`.
+    fn create_location_generator(
+        &self,
+        context: &LocationGeneratorContext<'_>,
+    ) -> Result<Arc<dyn LocationGenerator>>;
+}
+
+/// The built-in [`LocationGeneratorFactory`], which selects the layout from table properties.
+///
+/// It creates an [`ObjectStorageLocationGenerator`] when
+/// [`write.object-storage.enabled`](crate::spec::TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED)
+/// is `true`, and a [`DefaultLocationGenerator`] otherwise. It returns an error if a table
+/// property that determines the layout has an invalid value. Java's
+/// `write.location-provider.impl` is ignored; a custom factory set with
+/// [`TableBuilder::location_generator_factory`](crate::table::TableBuilder::location_generator_factory)
+/// can honor it and delegate other tables to this one.
+#[derive(Clone, Debug, Default)]
+pub struct ResolvingLocationGeneratorFactory;
+
+impl LocationGeneratorFactory for ResolvingLocationGeneratorFactory {
+    fn create_location_generator(
+        &self,
+        context: &LocationGeneratorContext<'_>,
+    ) -> Result<Arc<dyn LocationGenerator>> {
+        let table_metadata = context.metadata();
+        if table_metadata
+            .table_properties()
+            .write_object_storage_enabled()?
+        {
+            Ok(Arc::new(ObjectStorageLocationGenerator::new(
+                table_metadata,
+            )?))
+        } else {
+            Ok(Arc::new(DefaultLocationGenerator::new(table_metadata)?))
+        }
     }
 }
 
@@ -316,15 +373,17 @@ pub(crate) mod test {
     use uuid::Uuid;
 
     use super::LocationGenerator;
-    use crate::ErrorKind;
+    use crate::io::FileIO;
     use crate::spec::{
         FormatVersion, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
         Struct, StructType, TableMetadata, TableProperties, Transform, Type,
     };
+    use crate::table::Table;
+    use crate::test_utils::test_runtime;
     use crate::writer::file_writer::location_generator::{
         DefaultLocationGenerator, FileNameGenerator, ObjectStorageLocationGenerator,
-        table_location_generator,
     };
+    use crate::{ErrorKind, TableIdent};
 
     #[test]
     fn test_default_location_generate() {
@@ -680,7 +739,7 @@ pub(crate) mod test {
             schema,
             Struct::from_iter([Some(Literal::string("val#1"))]),
         );
-        let generator = table_location_generator(&metadata).unwrap();
+        let generator = table_with(metadata).location_generator().unwrap();
 
         assert_eq!(
             [
@@ -700,7 +759,7 @@ pub(crate) mod test {
                 "yes".to_string(),
             )]),
         );
-        let err = table_location_generator(&metadata).err().unwrap();
+        let err = table_with(metadata).location_generator().err().unwrap();
 
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
     }
@@ -720,6 +779,17 @@ pub(crate) mod test {
             generator.generate_location(None, "test.parquet"),
             "s3://data.db/table/data/test.parquet"
         );
+    }
+
+    /// Builds a table from `metadata` with the default location generator factory.
+    fn table_with(metadata: TableMetadata) -> Table {
+        Table::builder()
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["data", "table"]).unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
+            .build()
+            .unwrap()
     }
 
     /// Build a minimal `TableMetadata` for location generator tests.
