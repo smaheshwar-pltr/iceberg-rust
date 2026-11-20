@@ -238,7 +238,8 @@ impl<'a> LocationGeneratorContext<'a> {
 /// Creates the [`LocationGenerator`] for a table.
 ///
 /// Set one with
-/// [`TableBuilder::location_generator_factory`](crate::table::TableBuilder::location_generator_factory).
+/// [`CatalogBuilder::with_location_generator_factory`](crate::CatalogBuilder::with_location_generator_factory)
+/// or [`TableBuilder::location_generator_factory`](crate::table::TableBuilder::location_generator_factory).
 /// Each call to [`Table::location_generator`](crate::table::Table::location_generator) calls the
 /// table's factory with the table's current metadata. A factory that customizes only some tables
 /// can delegate the others to [`ResolvingLocationGeneratorFactory`].
@@ -257,7 +258,7 @@ pub trait LocationGeneratorFactory: Debug + Send + Sync {
 /// is `true`, and a [`DefaultLocationGenerator`] otherwise. It returns an error if a table
 /// property that determines the layout has an invalid value. Java's
 /// `write.location-provider.impl` is ignored; a custom factory set with
-/// [`TableBuilder::location_generator_factory`](crate::table::TableBuilder::location_generator_factory)
+/// [`CatalogBuilder::with_location_generator_factory`](crate::CatalogBuilder::with_location_generator_factory)
 /// can honor it and delegate other tables to this one.
 #[derive(Clone, Debug, Default)]
 pub struct ResolvingLocationGeneratorFactory;

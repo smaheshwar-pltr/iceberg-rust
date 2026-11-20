@@ -30,6 +30,7 @@ use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
+use iceberg::writer::file_writer::location_generator::LocationGeneratorFactory;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
     Runtime, TableCommit, TableCreation, TableIdent,
@@ -58,6 +59,7 @@ pub struct HmsCatalogBuilder {
     config: HmsCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
     kms_client_factory: Option<Arc<dyn KmsClientFactory>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     runtime: Option<Runtime>,
 }
 
@@ -73,6 +75,7 @@ impl Default for HmsCatalogBuilder {
             },
             storage_factory: None,
             kms_client_factory: None,
+            location_generator_factory: None,
             runtime: None,
         }
     }
@@ -88,6 +91,14 @@ impl CatalogBuilder for HmsCatalogBuilder {
 
     fn with_kms_client_factory(mut self, kms_client_factory: Arc<dyn KmsClientFactory>) -> Self {
         self.kms_client_factory = Some(kms_client_factory);
+        self
+    }
+
+    fn with_location_generator_factory(
+        mut self,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Self {
+        self.location_generator_factory = Some(location_generator_factory);
         self
     }
 
@@ -159,7 +170,13 @@ impl CatalogBuilder for HmsCatalogBuilder {
                 Some(rt) => rt,
                 None => Runtime::try_current()?,
             };
-            HmsCatalog::new(self.config, self.storage_factory, runtime, kms_client)
+            HmsCatalog::new(
+                self.config,
+                self.storage_factory,
+                runtime,
+                kms_client,
+                self.location_generator_factory,
+            )
         }
     }
 }
@@ -194,6 +211,7 @@ pub struct HmsCatalog {
     file_io: FileIO,
     runtime: Runtime,
     kms_client: Option<Arc<dyn KeyManagementClient>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
 }
 
 impl Debug for HmsCatalog {
@@ -211,6 +229,7 @@ impl HmsCatalog {
         storage_factory: Option<Arc<dyn StorageFactory>>,
         runtime: Runtime,
         kms_client: Option<Arc<dyn KeyManagementClient>>,
+        location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     ) -> Result<Self> {
         let address = config
             .address
@@ -252,6 +271,7 @@ impl HmsCatalog {
             file_io,
             runtime,
             kms_client,
+            location_generator_factory,
         })
     }
     /// Get the catalogs `FileIO`
@@ -562,6 +582,9 @@ impl Catalog for HmsCatalog {
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
         }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(location_generator_factory);
+        }
         builder.build()
     }
 
@@ -608,6 +631,9 @@ impl Catalog for HmsCatalog {
             .runtime(self.runtime.clone());
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
+        }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(location_generator_factory);
         }
         builder.build()
     }

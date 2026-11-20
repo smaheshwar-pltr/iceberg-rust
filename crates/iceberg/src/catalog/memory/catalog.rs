@@ -33,6 +33,7 @@ use crate::io::{FileIO, FileIOBuilder, MemoryStorageFactory, StorageFactory};
 use crate::runtime::Runtime;
 use crate::spec::{TableMetadata, TableMetadataBuilder};
 use crate::table::Table;
+use crate::writer::file_writer::location_generator::LocationGeneratorFactory;
 use crate::{
     Catalog, CatalogBuilder, MetadataLocation, Namespace, NamespaceIdent, Result, TableCommit,
     TableCreation, TableIdent, delete_removed_metadata_files,
@@ -49,6 +50,7 @@ const LOCATION: &str = "location";
 pub struct MemoryCatalogBuilder {
     storage_factory: Option<Arc<dyn StorageFactory>>,
     kms_client_factory: Option<Arc<dyn KmsClientFactory>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     runtime: Option<Runtime>,
 }
 
@@ -62,6 +64,14 @@ impl CatalogBuilder for MemoryCatalogBuilder {
 
     fn with_kms_client_factory(mut self, kms_client_factory: Arc<dyn KmsClientFactory>) -> Self {
         self.kms_client_factory = Some(kms_client_factory);
+        self
+    }
+
+    fn with_location_generator_factory(
+        mut self,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Self {
+        self.location_generator_factory = Some(location_generator_factory);
         self
     }
 
@@ -95,6 +105,7 @@ impl CatalogBuilder for MemoryCatalogBuilder {
                 self.storage_factory,
                 runtime,
                 kms_client,
+                self.location_generator_factory,
             )
         }
     }
@@ -115,6 +126,7 @@ pub struct MemoryCatalog {
     file_io: FileIO,
     runtime: Runtime,
     kms_client: Option<Arc<dyn KeyManagementClient>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
 }
 
 impl std::fmt::Debug for MemoryCatalog {
@@ -135,6 +147,7 @@ impl MemoryCatalog {
         storage_factory: Option<Arc<dyn StorageFactory>>,
         runtime: Runtime,
         kms_client: Option<Arc<dyn KeyManagementClient>>,
+        location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     ) -> Result<Self> {
         // Use provided factory or default to MemoryStorageFactory
         let factory = storage_factory.unwrap_or_else(|| Arc::new(MemoryStorageFactory));
@@ -146,6 +159,7 @@ impl MemoryCatalog {
             root_namespace_state: Mutex::new(NamespaceState::default()),
             runtime,
             kms_client,
+            location_generator_factory,
         })
     }
 
@@ -166,6 +180,9 @@ impl MemoryCatalog {
             .runtime(self.runtime.clone());
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
+        }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(location_generator_factory);
         }
         builder.build()
     }
@@ -326,6 +343,9 @@ impl Catalog for MemoryCatalog {
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
         }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(location_generator_factory);
+        }
         builder.build()
     }
 
@@ -396,6 +416,9 @@ impl Catalog for MemoryCatalog {
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
         }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(location_generator_factory);
+        }
         builder.build()
     }
 
@@ -441,18 +464,30 @@ pub(crate) mod tests {
     use std::iter::FromIterator;
     use std::vec;
 
+    use arrow_array::{Int32Array, RecordBatch};
+    use parquet::file::properties::WriterProperties;
     use regex::Regex;
     use tempfile::TempDir;
 
     use super::*;
-    use crate::ErrorKind;
+    use crate::arrow::schema_to_arrow_schema;
     use crate::encryption::kms::MemoryKmsClientFactory;
     use crate::io::{FileIO, LocalFsStorageFactory};
     use crate::spec::{
-        NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, TableProperties, Type,
+        DataFileFormat, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+        TableProperties, Type,
     };
     use crate::test_utils::test_runtime;
     use crate::transaction::{ApplyTransactionAction, Transaction};
+    use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use crate::writer::file_writer::ParquetWriterBuilder;
+    use crate::writer::file_writer::location_generator::{
+        DefaultFileNameGenerator, DefaultLocationGenerator, LocationGenerator,
+        LocationGeneratorContext, ResolvingLocationGeneratorFactory,
+    };
+    use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+    use crate::writer::{IcebergWriter, IcebergWriterBuilder};
+    use crate::{Error, ErrorKind};
 
     fn temp_path() -> String {
         let temp_dir = TempDir::new().unwrap();
@@ -2294,6 +2329,203 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(manifest_list.entries().len(), 0);
+    }
+
+    /// Java's table property naming a location provider class.
+    const LOCATION_PROVIDER_IMPL: &str = "write.location-provider.impl";
+    const TENANT_LOCATION_PROVIDER: &str = "com.example.TenantLocationProvider";
+
+    /// Maps the Java location provider class a table names to a Rust generator.
+    #[derive(Debug)]
+    struct JavaLocationProviderFactory;
+
+    impl LocationGeneratorFactory for JavaLocationProviderFactory {
+        fn create_location_generator(
+            &self,
+            context: &LocationGeneratorContext<'_>,
+        ) -> Result<Arc<dyn LocationGenerator>> {
+            let provider = context.metadata().properties().get(LOCATION_PROVIDER_IMPL);
+            match provider.map(String::as_str) {
+                Some(TENANT_LOCATION_PROVIDER) => {
+                    Ok(Arc::new(DefaultLocationGenerator::with_data_location(
+                        format!("memory:///tenant-data/{}", context.identifier()),
+                    )))
+                }
+                Some(class) => Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!("Location provider {class} is not supported"),
+                )),
+                None => ResolvingLocationGeneratorFactory.create_location_generator(context),
+            }
+        }
+    }
+
+    /// Creates a catalog using [`JavaLocationProviderFactory`], with namespace `ns`.
+    async fn new_memory_catalog_with_location_generator_factory() -> MemoryCatalog {
+        let catalog = MemoryCatalogBuilder::default()
+            .with_location_generator_factory(Arc::new(JavaLocationProviderFactory))
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    "memory:///warehouse".to_string(),
+                )]),
+            )
+            .await
+            .unwrap();
+        create_namespace(&catalog, &NamespaceIdent::new("ns".into())).await;
+        catalog
+    }
+
+    /// Creates `ns.{name}`, naming `provider` as its Java location provider if given.
+    async fn create_table_with_location_provider(
+        catalog: &MemoryCatalog,
+        name: &str,
+        provider: Option<&str>,
+    ) -> Table {
+        let properties =
+            provider.map(|class| (LOCATION_PROVIDER_IMPL.to_string(), class.to_string()));
+        catalog
+            .create_table(
+                &NamespaceIdent::new("ns".into()),
+                TableCreation::builder()
+                    .name(name.into())
+                    .schema(simple_table_schema())
+                    .properties(properties)
+                    .build(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn data_file_location(table: &Table) -> Result<String> {
+        Ok(table
+            .location_generator()?
+            .generate_location(None, "data.parquet"))
+    }
+
+    #[tokio::test]
+    async fn test_created_table_uses_custom_generator_from_factory() {
+        let catalog = new_memory_catalog_with_location_generator_factory().await;
+
+        let table =
+            create_table_with_location_provider(&catalog, "tenant", Some(TENANT_LOCATION_PROVIDER))
+                .await;
+
+        assert_eq!(
+            data_file_location(&table).unwrap(),
+            "memory:///tenant-data/ns.tenant/data.parquet"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_created_table_without_provider_uses_built_in_layout() {
+        let catalog = new_memory_catalog_with_location_generator_factory().await;
+
+        let table = create_table_with_location_provider(&catalog, "plain", None).await;
+
+        assert_eq!(
+            data_file_location(&table).unwrap(),
+            "memory:///warehouse/ns/plain/data/data.parquet"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_created_table_with_unknown_provider_gets_factory_error() {
+        let catalog = new_memory_catalog_with_location_generator_factory().await;
+
+        let table = create_table_with_location_provider(
+            &catalog,
+            "unknown",
+            Some("com.example.UnknownLocationProvider"),
+        )
+        .await;
+
+        assert_eq!(
+            data_file_location(&table).unwrap_err().kind(),
+            ErrorKind::FeatureUnsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn test_registered_table_uses_location_generator_factory() {
+        let catalog = new_memory_catalog_with_location_generator_factory().await;
+        let created =
+            create_table_with_location_provider(&catalog, "tenant", Some(TENANT_LOCATION_PROVIDER))
+                .await;
+
+        let registered = catalog
+            .register_table(
+                &TableIdent::from_strs(["ns", "registered"]).unwrap(),
+                created.metadata_location().unwrap().to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            data_file_location(&registered).unwrap(),
+            "memory:///tenant-data/ns.registered/data.parquet"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_data_file_writer_writes_where_loaded_table_factory_says() {
+        let catalog = new_memory_catalog_with_location_generator_factory().await;
+        create_table_with_location_provider(&catalog, "tenant", Some(TENANT_LOCATION_PROVIDER))
+            .await;
+        let table = catalog
+            .load_table(&TableIdent::from_strs(["ns", "tenant"]).unwrap())
+            .await
+            .unwrap();
+        let schema = table.current_schema_ref();
+        let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            ParquetWriterBuilder::new(WriterProperties::default(), schema.clone()),
+            table.file_io().clone(),
+            table.location_generator().unwrap(),
+            DefaultFileNameGenerator::new("part".to_string(), None, DataFileFormat::Parquet),
+        );
+        let mut writer = DataFileWriterBuilder::new(rolling_writer_builder)
+            .build(None)
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(Arc::new(schema_to_arrow_schema(&schema).unwrap()), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+        ])
+        .unwrap();
+
+        writer.write(batch).await.unwrap();
+        let data_files = writer.close().await.unwrap();
+
+        let path = "memory:///tenant-data/ns.tenant/part-00000.parquet";
+        assert_eq!(
+            data_files.iter().map(|file| file.file_path()).collect_vec(),
+            vec![path]
+        );
+        assert!(table.file_io().exists(path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_committed_location_provider_reaches_returned_table() {
+        let catalog = new_memory_catalog_with_location_generator_factory().await;
+        let table = create_table_with_location_provider(&catalog, "t", None).await;
+
+        let tx = Transaction::new(&table);
+        let updated = tx
+            .update_table_properties()
+            .set(
+                LOCATION_PROVIDER_IMPL.to_string(),
+                TENANT_LOCATION_PROVIDER.to_string(),
+            )
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            data_file_location(&updated).unwrap(),
+            "memory:///tenant-data/ns.t/data.parquet"
+        );
     }
 
     fn build_table(ident: TableIdent) -> Table {
