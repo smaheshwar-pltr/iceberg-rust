@@ -33,6 +33,7 @@ use crate::io::{FileIO, FileIOBuilder, MemoryStorageFactory, StorageFactory};
 use crate::runtime::Runtime;
 use crate::spec::{TableMetadata, TableMetadataBuilder};
 use crate::table::Table;
+use crate::writer::file_writer::location_generator::LocationGeneratorFactory;
 use crate::{
     Catalog, CatalogBuilder, MetadataLocation, Namespace, NamespaceIdent, Result, TableCommit,
     TableCreation, TableIdent,
@@ -49,6 +50,7 @@ const LOCATION: &str = "location";
 pub struct MemoryCatalogBuilder {
     storage_factory: Option<Arc<dyn StorageFactory>>,
     kms_client_factory: Option<Arc<dyn KmsClientFactory>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     runtime: Option<Runtime>,
 }
 
@@ -62,6 +64,14 @@ impl CatalogBuilder for MemoryCatalogBuilder {
 
     fn with_kms_client_factory(mut self, kms_client_factory: Arc<dyn KmsClientFactory>) -> Self {
         self.kms_client_factory = Some(kms_client_factory);
+        self
+    }
+
+    fn with_location_generator_factory(
+        mut self,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Self {
+        self.location_generator_factory = Some(location_generator_factory);
         self
     }
 
@@ -95,6 +105,7 @@ impl CatalogBuilder for MemoryCatalogBuilder {
                 self.storage_factory,
                 runtime,
                 kms_client,
+                self.location_generator_factory,
             )
         }
     }
@@ -115,6 +126,7 @@ pub struct MemoryCatalog {
     file_io: FileIO,
     runtime: Runtime,
     kms_client: Option<Arc<dyn KeyManagementClient>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
 }
 
 impl std::fmt::Debug for MemoryCatalog {
@@ -135,6 +147,7 @@ impl MemoryCatalog {
         storage_factory: Option<Arc<dyn StorageFactory>>,
         runtime: Runtime,
         kms_client: Option<Arc<dyn KeyManagementClient>>,
+        location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     ) -> Result<Self> {
         // Use provided factory or default to MemoryStorageFactory
         let factory = storage_factory.unwrap_or_else(|| Arc::new(MemoryStorageFactory));
@@ -146,6 +159,7 @@ impl MemoryCatalog {
             root_namespace_state: Mutex::new(NamespaceState::default()),
             runtime,
             kms_client,
+            location_generator_factory,
         })
     }
 
@@ -166,6 +180,9 @@ impl MemoryCatalog {
             .runtime(self.runtime.clone());
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
+        }
+        if let Some(factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(factory);
         }
         builder.build()
     }
@@ -326,6 +343,9 @@ impl Catalog for MemoryCatalog {
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
         }
+        if let Some(factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(factory);
+        }
         builder.build()
     }
 
@@ -396,6 +416,9 @@ impl Catalog for MemoryCatalog {
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
         }
+        if let Some(factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(factory);
+        }
         builder.build()
     }
 
@@ -432,16 +455,28 @@ pub(crate) mod tests {
     use std::iter::FromIterator;
     use std::vec;
 
+    use arrow_array::{Int32Array, RecordBatch};
+    use parquet::file::properties::WriterProperties;
     use regex::Regex;
     use tempfile::TempDir;
 
     use super::*;
     use crate::ErrorKind;
+    use crate::arrow::schema_to_arrow_schema;
     use crate::encryption::kms::MemoryKmsClientFactory;
     use crate::io::{FileIO, LocalFsStorageFactory};
-    use crate::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type};
-    use crate::test_utils::test_runtime;
+    use crate::spec::{
+        DataFileFormat, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type,
+    };
+    use crate::test_utils::{CUSTOM_LOCATION_PROVIDER, JavaLocationProviderFactory, test_runtime};
     use crate::transaction::{ApplyTransactionAction, Transaction};
+    use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use crate::writer::file_writer::ParquetWriterBuilder;
+    use crate::writer::file_writer::location_generator::{
+        DefaultFileNameGenerator, JAVA_LOCATION_PROVIDER_IMPL, LocationGenerator,
+    };
+    use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+    use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
     fn temp_path() -> String {
         let temp_dir = TempDir::new().unwrap();
@@ -2089,6 +2124,113 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(manifest_list.entries().len(), 0);
+    }
+
+    async fn create_table_with_properties<C: Catalog>(
+        catalog: &C,
+        properties: HashMap<String, String>,
+    ) -> Table {
+        let namespace_ident = NamespaceIdent::new("abc".into());
+        create_namespace(catalog, &namespace_ident).await;
+        catalog
+            .create_table(
+                &namespace_ident,
+                TableCreation::builder()
+                    .name("test".into())
+                    .schema(simple_table_schema())
+                    .properties(properties)
+                    .build(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Builds a memory catalog whose tables use [`JavaLocationProviderFactory`].
+    async fn new_custom_location_catalog() -> MemoryCatalog {
+        MemoryCatalogBuilder::default()
+            .with_location_generator_factory(Arc::new(JavaLocationProviderFactory))
+            .load(
+                "memory",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), temp_path())]),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_location_generator_factory_reaches_created_and_loaded_tables() {
+        let catalog = new_custom_location_catalog().await;
+        let created = create_table_with_properties(
+            &catalog,
+            HashMap::from([(
+                JAVA_LOCATION_PROVIDER_IMPL.to_string(),
+                CUSTOM_LOCATION_PROVIDER.to_string(),
+            )]),
+        )
+        .await;
+        let loaded = catalog.load_table(created.identifier()).await.unwrap();
+
+        assert_eq!(
+            [&created, &loaded].map(|table| {
+                table
+                    .location_generator()
+                    .unwrap()
+                    .generate_location(None, "test.parquet")
+            }),
+            ["memory:///custom/abc/test/test.parquet"; 2]
+        );
+
+        let schema = loaded.metadata().current_schema().clone();
+        let batch = RecordBatch::try_new(Arc::new(schema_to_arrow_schema(&schema).unwrap()), vec![
+            Arc::new(Int32Array::from(vec![1])),
+        ])
+        .unwrap();
+        let mut writer =
+            DataFileWriterBuilder::new(RollingFileWriterBuilder::new_with_default_file_size(
+                ParquetWriterBuilder::new(WriterProperties::default(), schema),
+                loaded.file_io().clone(),
+                loaded.location_generator().unwrap(),
+                DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet),
+            ))
+            .build(None)
+            .await
+            .unwrap();
+        writer.write(batch).await.unwrap();
+        let data_files = writer.close().await.unwrap();
+
+        let paths = data_files
+            .iter()
+            .map(|data_file| data_file.file_path())
+            .collect_vec();
+        assert_eq!(paths, ["memory:///custom/abc/test/test-00000.parquet"]);
+        assert!(loaded.file_io().exists(paths[0]).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_location_generator_follows_committed_properties() {
+        let catalog = new_custom_location_catalog().await;
+        let table = create_table_with_properties(&catalog, HashMap::new()).await;
+
+        let tx = Transaction::new(&table);
+        let updated_table = tx
+            .update_table_properties()
+            .set(
+                JAVA_LOCATION_PROVIDER_IMPL.to_string(),
+                CUSTOM_LOCATION_PROVIDER.to_string(),
+            )
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            updated_table
+                .location_generator()
+                .unwrap()
+                .generate_location(None, "test.parquet"),
+            "memory:///custom/abc/test/test.parquet"
+        );
     }
 
     fn build_table(ident: TableIdent) -> Table {

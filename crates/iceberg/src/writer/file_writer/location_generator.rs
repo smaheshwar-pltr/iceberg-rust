@@ -17,12 +17,13 @@
 
 //! This module contains the location generator and file name generator for generating path of data file.
 
+use std::fmt::{self, Debug};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use crate::Result;
 use crate::spec::{DataFileFormat, PartitionKey, TableMetadata};
 use crate::util::location::strip_trailing_slash;
+use crate::{Result, TableIdent};
 
 /// `LocationGenerator` used to generate the location of data file.
 pub trait LocationGenerator: Clone + Send + Sync + 'static {
@@ -50,10 +51,17 @@ const HASH_BINARY_STRING_BITS: usize = 20;
 const ENTROPY_DIR_LENGTH: usize = 4;
 /// Number of entropy directories generated from the hash.
 const ENTROPY_DIR_DEPTH: usize = 3;
+/// Java's table property naming a custom location provider class.
+pub(crate) const JAVA_LOCATION_PROVIDER_IMPL: &str = "write.location-provider.impl";
 
 #[derive(Clone, Debug)]
 /// `DefaultLocationGenerator` used to generate the data dir location of data file.
 /// The location is generated based on the table location and the data location in table properties.
+///
+/// Paths use `{data location}/{partition path}/{file name}`, omitting the
+/// partition path for unpartitioned files. It ignores `write.object-storage.enabled`; use
+/// [`Table::location_generator`](crate::table::Table::location_generator) for the layout the
+/// table is configured with.
 pub struct DefaultLocationGenerator {
     data_location: String,
 }
@@ -203,6 +211,137 @@ impl LocationGenerator for ObjectStorageLocationGenerator {
     }
 }
 
+/// The [`LocationGenerator`] that a table's [`LocationGeneratorFactory`] chose for it.
+///
+/// Get one from [`Table::location_generator`](crate::table::Table::location_generator).
+#[derive(Clone)]
+pub struct TableLocationGenerator {
+    inner: Arc<dyn ErasedLocationGenerator>,
+}
+
+impl TableLocationGenerator {
+    /// Wraps `generator` so a [`LocationGeneratorFactory`] can return it.
+    pub fn new(generator: impl LocationGenerator) -> Self {
+        Self {
+            inner: Arc::new(generator),
+        }
+    }
+}
+
+impl Debug for TableLocationGenerator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TableLocationGenerator")
+            .finish_non_exhaustive()
+    }
+}
+
+impl LocationGenerator for TableLocationGenerator {
+    fn generate_location(&self, partition_key: Option<&PartitionKey>, file_name: &str) -> String {
+        self.inner
+            .erased_generate_location(partition_key, file_name)
+    }
+}
+
+/// Dyn-compatible form of [`LocationGenerator`], whose `Clone` bound rules out trait objects.
+trait ErasedLocationGenerator: Send + Sync {
+    fn erased_generate_location(
+        &self,
+        partition_key: Option<&PartitionKey>,
+        file_name: &str,
+    ) -> String;
+}
+
+impl<G: LocationGenerator> ErasedLocationGenerator for G {
+    fn erased_generate_location(
+        &self,
+        partition_key: Option<&PartitionKey>,
+        file_name: &str,
+    ) -> String {
+        self.generate_location(partition_key, file_name)
+    }
+}
+
+/// The table that a [`LocationGeneratorFactory`] creates a location generator for.
+#[derive(Debug)]
+pub struct LocationGeneratorContext<'a> {
+    metadata: &'a TableMetadata,
+    identifier: &'a TableIdent,
+}
+
+impl<'a> LocationGeneratorContext<'a> {
+    pub(crate) fn new(metadata: &'a TableMetadata, identifier: &'a TableIdent) -> Self {
+        Self {
+            metadata,
+            identifier,
+        }
+    }
+
+    /// Returns the table's current metadata.
+    pub fn metadata(&self) -> &'a TableMetadata {
+        self.metadata
+    }
+
+    /// Returns the table's identifier.
+    pub fn identifier(&self) -> &'a TableIdent {
+        self.identifier
+    }
+}
+
+/// Creates the location generator that a table writes data files with.
+///
+/// Set one with
+/// [`CatalogBuilder::with_location_generator_factory`](crate::CatalogBuilder::with_location_generator_factory).
+/// [`Table::location_generator`](crate::table::Table::location_generator) calls
+/// [`create_location_generator`](Self::create_location_generator) on every call, with the
+/// table's current metadata.
+pub trait LocationGeneratorFactory: Debug + Send + Sync {
+    /// Creates a location generator for the table in `context`.
+    fn create_location_generator(
+        &self,
+        context: &LocationGeneratorContext<'_>,
+    ) -> Result<TableLocationGenerator>;
+}
+
+/// The default [`LocationGeneratorFactory`], which selects the layout from table properties.
+///
+/// It creates an [`ObjectStorageLocationGenerator`] when
+/// [`write.object-storage.enabled`](crate::spec::TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED)
+/// is `true`, and a [`DefaultLocationGenerator`] otherwise. It fails if a table property that
+/// determines the layout has an invalid value. Java's `write.location-provider.impl` is ignored
+/// with a warning; custom factories can honor it and delegate other tables to this one.
+#[derive(Debug, Default)]
+pub struct ResolvingLocationGeneratorFactory;
+
+impl LocationGeneratorFactory for ResolvingLocationGeneratorFactory {
+    fn create_location_generator(
+        &self,
+        context: &LocationGeneratorContext<'_>,
+    ) -> Result<TableLocationGenerator> {
+        let metadata = context.metadata();
+        let object_storage = metadata.table_properties().write_object_storage_enabled()?;
+        if let Some(provider) = metadata.properties().get(JAVA_LOCATION_PROVIDER_IMPL) {
+            let layout = if object_storage {
+                "object storage"
+            } else {
+                "default"
+            };
+            tracing::warn!(
+                "Ignoring table property {JAVA_LOCATION_PROVIDER_IMPL}={provider}; using the \
+                 {layout} layout. Set a custom LocationGeneratorFactory to honor it."
+            );
+        }
+        if object_storage {
+            Ok(TableLocationGenerator::new(
+                ObjectStorageLocationGenerator::new(metadata)?,
+            ))
+        } else {
+            Ok(TableLocationGenerator::new(DefaultLocationGenerator::new(
+                metadata,
+            )?))
+        }
+    }
+}
+
 /// Derive the `{parent}/{name}` context from a table location, mirroring Hadoop's
 /// `Path.getParent().getName()` / `Path.getName()`.
 fn path_context(table_location: &str) -> String {
@@ -291,16 +430,21 @@ pub(crate) mod test {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use rstest::rstest;
     use uuid::Uuid;
 
-    use super::LocationGenerator;
+    use super::{JAVA_LOCATION_PROVIDER_IMPL, LocationGenerator};
+    use crate::io::FileIO;
     use crate::spec::{
         FormatVersion, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
         Struct, StructType, TableMetadata, TableProperties, Transform, Type,
     };
+    use crate::table::{Table, TableBuilder};
+    use crate::test_utils::{CUSTOM_LOCATION_PROVIDER, JavaLocationProviderFactory, test_runtime};
     use crate::writer::file_writer::location_generator::{
         DefaultLocationGenerator, FileNameGenerator, ObjectStorageLocationGenerator,
     };
+    use crate::{ErrorKind, TableIdent};
 
     #[test]
     fn test_default_location_generate() {
@@ -607,6 +751,156 @@ pub(crate) mod test {
             location,
             "s3://data.db/table/data_primary/0101/0110/1001/10110010/a"
         );
+    }
+
+    #[rstest]
+    #[case::unset(&[], [
+        "s3://data.db/table/data/test.parquet",
+        "s3://data.db/table/data/data%231=val%231/test.parquet",
+    ])]
+    #[case::disabled(&[(TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED, "false")], [
+        "s3://data.db/table/data/test.parquet",
+        "s3://data.db/table/data/data%231=val%231/test.parquet",
+    ])]
+    #[case::java_location_provider(&[(JAVA_LOCATION_PROVIDER_IMPL, "com.example.Provider")], [
+        "s3://data.db/table/data/test.parquet",
+        "s3://data.db/table/data/data%231=val%231/test.parquet",
+    ])]
+    #[case::enabled(&[(TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED, "true")], [
+        "s3://data.db/table/data/0110/1010/0011/11101000/test.parquet",
+        "s3://data.db/table/data/0000/1011/0110/00001000/data%231=val%231/test.parquet",
+    ])]
+    fn test_table_location_follows_properties(
+        #[case] properties: &[(&str, &str)],
+        #[case] expected: [&str; 2],
+    ) {
+        let metadata = table_metadata_with(
+            "s3://data.db/table",
+            properties
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        );
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "data#1", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("data#1", "data#1", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let partition_key = PartitionKey::new(
+            partition_spec,
+            schema,
+            Struct::from_iter([Some(Literal::string("val#1"))]),
+        );
+        let generator = table_builder(metadata)
+            .build()
+            .unwrap()
+            .location_generator()
+            .unwrap();
+
+        assert_eq!(
+            [
+                generator.generate_location(None, "test.parquet"),
+                generator.generate_location(Some(&partition_key), "test.parquet"),
+            ],
+            expected
+        );
+    }
+
+    #[test]
+    fn test_table_location_rejects_invalid_property() {
+        let metadata = table_metadata_with(
+            "s3://data.db/table",
+            HashMap::from([(
+                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED.to_string(),
+                "yes".to_string(),
+            )]),
+        );
+        let err = table_builder(metadata)
+            .build()
+            .unwrap()
+            .location_generator()
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[rstest]
+    #[case::custom_provider(
+        &[(JAVA_LOCATION_PROVIDER_IMPL, CUSTOM_LOCATION_PROVIDER)],
+        "memory:///custom/ns/table/test.parquet",
+    )]
+    #[case::no_provider(&[], "s3://data.db/table/data/test.parquet")]
+    fn test_custom_factory_selects_generator_by_java_provider(
+        #[case] properties: &[(&str, &str)],
+        #[case] expected: &str,
+    ) {
+        let metadata = table_metadata_with(
+            "s3://data.db/table",
+            properties
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        );
+        let table = table_builder(metadata)
+            .location_generator_factory(Arc::new(JavaLocationProviderFactory))
+            .build()
+            .unwrap();
+        let generator = table.location_generator().unwrap();
+
+        assert_eq!(generator.generate_location(None, "test.parquet"), expected);
+    }
+
+    #[test]
+    fn test_custom_factory_rejects_unknown_java_provider() {
+        let metadata = table_metadata_with(
+            "s3://data.db/table",
+            HashMap::from([(
+                JAVA_LOCATION_PROVIDER_IMPL.to_string(),
+                "org.example.UnknownLocationProvider".to_string(),
+            )]),
+        );
+        let table = table_builder(metadata)
+            .location_generator_factory(Arc::new(JavaLocationProviderFactory))
+            .build()
+            .unwrap();
+        let err = table.location_generator().unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+    }
+
+    #[test]
+    fn test_default_location_ignores_object_storage_property() {
+        let metadata = table_metadata_with(
+            "s3://data.db/table",
+            HashMap::from([(
+                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED.to_string(),
+                "true".to_string(),
+            )]),
+        );
+        let generator = DefaultLocationGenerator::new(&metadata).unwrap();
+
+        assert_eq!(
+            generator.generate_location(None, "test.parquet"),
+            "s3://data.db/table/data/test.parquet"
+        );
+    }
+
+    /// Starts building table `ns.table` with `metadata`.
+    fn table_builder(metadata: TableMetadata) -> TableBuilder {
+        Table::builder()
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["ns", "table"]).unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
     }
 
     /// Build a minimal `TableMetadata` for location generator tests.

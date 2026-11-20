@@ -31,6 +31,10 @@ use crate::scan::TableScanBuilder;
 use crate::spec::{
     ManifestListReader, ManifestReader, SchemaRef, SnapshotRef, TableMetadata, TableMetadataRef,
 };
+use crate::writer::file_writer::location_generator::{
+    LocationGeneratorContext, LocationGeneratorFactory, ResolvingLocationGeneratorFactory,
+    TableLocationGenerator,
+};
 use crate::{Result, TableIdent};
 
 /// Builder to create table scan.
@@ -40,6 +44,7 @@ pub struct TableBuilder {
     metadata: Option<TableMetadataRef>,
     identifier: Option<TableIdent>,
     kms_client: Option<Arc<dyn KeyManagementClient>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     readonly: bool,
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
@@ -54,6 +59,7 @@ impl TableBuilder {
             metadata: None,
             identifier: None,
             kms_client: None,
+            location_generator_factory: None,
             readonly: false,
             disable_cache: false,
             cache_size_bytes: None,
@@ -121,6 +127,17 @@ impl TableBuilder {
         self
     }
 
+    /// optional - sets the factory that creates the table's location generator.
+    ///
+    /// Defaults to [`ResolvingLocationGeneratorFactory`].
+    pub fn location_generator_factory(
+        mut self,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Self {
+        self.location_generator_factory = Some(location_generator_factory);
+        self
+    }
+
     /// build the Table
     pub fn build(self) -> Result<Table> {
         let Self {
@@ -129,6 +146,7 @@ impl TableBuilder {
             metadata,
             identifier,
             kms_client,
+            location_generator_factory,
             readonly,
             disable_cache,
             cache_size_bytes,
@@ -189,6 +207,8 @@ impl TableBuilder {
             object_cache,
             runtime,
             encryption_manager,
+            location_generator_factory: location_generator_factory
+                .unwrap_or_else(|| Arc::new(ResolvingLocationGeneratorFactory)),
         })
     }
 }
@@ -204,6 +224,7 @@ pub struct Table {
     object_cache: Arc<ObjectCache>,
     runtime: Runtime,
     encryption_manager: Option<Arc<EncryptionManager>>,
+    location_generator_factory: Arc<dyn LocationGeneratorFactory>,
 }
 
 impl Table {
@@ -315,6 +336,22 @@ impl Table {
     /// Create a reader for the table.
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
         ArrowReaderBuilder::new(self.file_io.clone(), self.runtime().clone())
+    }
+
+    /// Creates a location generator for this table with its [`LocationGeneratorFactory`].
+    ///
+    /// Tables use [`ResolvingLocationGeneratorFactory`] unless their catalog or
+    /// [`TableBuilder::location_generator_factory`] set another factory.
+    ///
+    /// # Errors
+    ///
+    /// Returns the factory's error.
+    pub fn location_generator(&self) -> Result<TableLocationGenerator> {
+        self.location_generator_factory
+            .create_location_generator(&LocationGeneratorContext::new(
+                &self.metadata,
+                &self.identifier,
+            ))
     }
 }
 

@@ -23,11 +23,13 @@
 
 mod delete_vector;
 mod encryption;
+mod location_generator;
 mod record_batch;
 mod runtime;
 pub(crate) mod scan;
 
 pub(crate) use delete_vector::encode_dv_blob;
 pub(crate) use encryption::{make_encrypted_table, make_encryption_manager};
+pub(crate) use location_generator::{CUSTOM_LOCATION_PROVIDER, JavaLocationProviderFactory};
 pub(crate) use record_batch::check_record_batches;
 pub(crate) use runtime::test_runtime;

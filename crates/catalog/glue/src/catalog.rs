@@ -32,6 +32,7 @@ use iceberg::io::{
 };
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
+use iceberg::writer::file_writer::location_generator::LocationGeneratorFactory;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
     Runtime, TableCommit, TableCreation, TableIdent,
@@ -60,6 +61,7 @@ pub struct GlueCatalogBuilder {
     config: GlueCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
     kms_client_factory: Option<Arc<dyn KmsClientFactory>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     runtime: Option<Runtime>,
 }
 
@@ -75,6 +77,7 @@ impl Default for GlueCatalogBuilder {
             },
             storage_factory: None,
             kms_client_factory: None,
+            location_generator_factory: None,
             runtime: None,
         }
     }
@@ -90,6 +93,14 @@ impl CatalogBuilder for GlueCatalogBuilder {
 
     fn with_kms_client_factory(mut self, kms_client_factory: Arc<dyn KmsClientFactory>) -> Self {
         self.kms_client_factory = Some(kms_client_factory);
+        self
+    }
+
+    fn with_location_generator_factory(
+        mut self,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Self {
+        self.location_generator_factory = Some(location_generator_factory);
         self
     }
 
@@ -152,7 +163,14 @@ impl CatalogBuilder for GlueCatalogBuilder {
                 Some(factory) => Some(factory.create_kms_client(&self.config.props).await?),
                 None => None,
             };
-            GlueCatalog::new(self.config, self.storage_factory, runtime, kms_client).await
+            GlueCatalog::new(
+                self.config,
+                self.storage_factory,
+                runtime,
+                kms_client,
+                self.location_generator_factory,
+            )
+            .await
         }
     }
 }
@@ -176,6 +194,7 @@ pub struct GlueCatalog {
     file_io: FileIO,
     runtime: Runtime,
     kms_client: Option<Arc<dyn KeyManagementClient>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
 }
 
 impl Debug for GlueCatalog {
@@ -193,6 +212,7 @@ impl GlueCatalog {
         storage_factory: Option<Arc<dyn StorageFactory>>,
         runtime: Runtime,
         kms_client: Option<Arc<dyn KeyManagementClient>>,
+        location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     ) -> Result<Self> {
         let sdk_config = create_sdk_config(&config.props, config.uri.as_ref()).await;
         let mut file_io_props = config.props.clone();
@@ -243,6 +263,7 @@ impl GlueCatalog {
             file_io,
             runtime,
             kms_client,
+            location_generator_factory,
         })
     }
     /// Get the catalogs `FileIO`
@@ -304,6 +325,9 @@ impl GlueCatalog {
             .runtime(self.runtime.clone());
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
+        }
+        if let Some(factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(factory);
         }
         let table = builder.build()?;
 
@@ -661,6 +685,9 @@ impl Catalog for GlueCatalog {
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
         }
+        if let Some(factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(factory);
+        }
         builder.build()
     }
 
@@ -893,6 +920,9 @@ impl Catalog for GlueCatalog {
             .runtime(self.runtime.clone());
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
+        }
+        if let Some(factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(factory);
         }
         Ok(builder.build()?)
     }

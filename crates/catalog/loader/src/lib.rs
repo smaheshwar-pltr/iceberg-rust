@@ -21,6 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use iceberg::encryption::kms::KmsClientFactory;
 use iceberg::io::StorageFactory;
+use iceberg::writer::file_writer::location_generator::LocationGeneratorFactory;
 use iceberg::{Catalog, CatalogBuilder, Error, ErrorKind, Result, Runtime};
 use iceberg_catalog_glue::GlueCatalogBuilder;
 use iceberg_catalog_hms::HmsCatalogBuilder;
@@ -61,6 +62,13 @@ pub trait BoxedCatalogBuilder: Send {
         kms_client_factory: Arc<dyn KmsClientFactory>,
     ) -> Box<dyn BoxedCatalogBuilder>;
 
+    /// Sets the factory that creates the location generators of the catalog's tables; see
+    /// [`CatalogBuilder::with_location_generator_factory`].
+    fn with_location_generator_factory(
+        self: Box<Self>,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Box<dyn BoxedCatalogBuilder>;
+
     /// Sets the runtime the catalog, and the tables it creates, spawn their
     /// tasks on; see [`CatalogBuilder::with_runtime`].
     fn with_runtime(self: Box<Self>, runtime: Runtime) -> Box<dyn BoxedCatalogBuilder>;
@@ -88,6 +96,16 @@ impl<T: CatalogBuilder + 'static> BoxedCatalogBuilder for T {
         Box::new(CatalogBuilder::with_kms_client_factory(
             *self,
             kms_client_factory,
+        ))
+    }
+
+    fn with_location_generator_factory(
+        self: Box<Self>,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Box<dyn BoxedCatalogBuilder> {
+        Box::new(CatalogBuilder::with_location_generator_factory(
+            *self,
+            location_generator_factory,
         ))
     }
 
@@ -155,6 +173,7 @@ mod tests {
     use iceberg::encryption::kms::KmsClientFactory;
     use iceberg::io::{LocalFsStorageFactory, StorageFactory};
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
+    use iceberg::writer::file_writer::location_generator::LocationGeneratorFactory;
     use iceberg::{CatalogBuilder, Result, Runtime};
     use sqlx::migrate::MigrateDatabase;
     use tempfile::TempDir;
@@ -316,6 +335,13 @@ mod tests {
         }
 
         fn with_kms_client_factory(self, _kms_client_factory: Arc<dyn KmsClientFactory>) -> Self {
+            self
+        }
+
+        fn with_location_generator_factory(
+            self,
+            _location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+        ) -> Self {
             self
         }
 
