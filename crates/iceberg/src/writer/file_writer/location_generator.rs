@@ -293,6 +293,8 @@ impl<'a> LocationGeneratorContext<'a> {
 /// Creates the location generator that a table writes data files with.
 ///
 /// Set one with
+/// [`CatalogBuilder::with_location_generator_factory`](crate::CatalogBuilder::with_location_generator_factory)
+/// or
 /// [`TableBuilder::location_generator_factory`](crate::table::TableBuilder::location_generator_factory).
 /// [`Table::location_generator`](crate::table::Table::location_generator) calls
 /// [`create_location_generator`](Self::create_location_generator) on every call, with the
@@ -311,7 +313,9 @@ pub trait LocationGeneratorFactory: Debug + Send + Sync {
 /// [`write.object-storage.enabled`](crate::spec::TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED)
 /// is `true`, and a [`DefaultLocationGenerator`] otherwise. It fails if a table property that
 /// determines the layout has an invalid value. Java's `write.location-provider.impl` is ignored;
-/// custom factories can honor it and delegate other tables to this one.
+/// a custom factory set with
+/// [`CatalogBuilder::with_location_generator_factory`](crate::CatalogBuilder::with_location_generator_factory)
+/// can honor it and delegate other tables to this one.
 #[derive(Clone, Debug, Default)]
 pub struct ResolvingLocationGeneratorFactory;
 

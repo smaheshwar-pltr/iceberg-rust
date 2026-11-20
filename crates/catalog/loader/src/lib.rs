@@ -21,6 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use iceberg::encryption::kms::KmsClientFactory;
 use iceberg::io::StorageFactory;
+use iceberg::writer::file_writer::location_generator::LocationGeneratorFactory;
 use iceberg::{Catalog, CatalogBuilder, Error, ErrorKind, Result, Runtime};
 use iceberg_catalog_glue::GlueCatalogBuilder;
 use iceberg_catalog_hms::HmsCatalogBuilder;
@@ -61,6 +62,13 @@ pub trait BoxedCatalogBuilder: Send {
         kms_client_factory: Arc<dyn KmsClientFactory>,
     ) -> Box<dyn BoxedCatalogBuilder>;
 
+    /// Sets the factory that creates the location generators of the catalog's tables; see
+    /// [`CatalogBuilder::with_location_generator_factory`].
+    fn with_location_generator_factory(
+        self: Box<Self>,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Box<dyn BoxedCatalogBuilder>;
+
     /// Sets the runtime the catalog, and the tables it creates, spawn their
     /// tasks on; see [`CatalogBuilder::with_runtime`].
     fn with_runtime(self: Box<Self>, runtime: Runtime) -> Box<dyn BoxedCatalogBuilder>;
@@ -88,6 +96,16 @@ impl<T: CatalogBuilder + 'static> BoxedCatalogBuilder for T {
         Box::new(CatalogBuilder::with_kms_client_factory(
             *self,
             kms_client_factory,
+        ))
+    }
+
+    fn with_location_generator_factory(
+        self: Box<Self>,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Box<dyn BoxedCatalogBuilder> {
+        Box::new(CatalogBuilder::with_location_generator_factory(
+            *self,
+            location_generator_factory,
         ))
     }
 
@@ -130,6 +148,7 @@ pub struct CatalogLoader<'a> {
     catalog_type: &'a str,
     storage_factory: Option<Arc<dyn StorageFactory>>,
     kms_client_factory: Option<Arc<dyn KmsClientFactory>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     runtime: Option<Runtime>,
 }
 
@@ -139,6 +158,7 @@ impl<'a> From<&'a str> for CatalogLoader<'a> {
             catalog_type: s,
             storage_factory: None,
             kms_client_factory: None,
+            location_generator_factory: None,
             runtime: None,
         }
     }
@@ -159,6 +179,16 @@ impl CatalogLoader<'_> {
         kms_client_factory: Arc<dyn KmsClientFactory>,
     ) -> Self {
         self.kms_client_factory = Some(kms_client_factory);
+        self
+    }
+
+    /// Sets the factory that creates the location generators of the catalog's tables; see
+    /// [`CatalogBuilder::with_location_generator_factory`].
+    pub fn with_location_generator_factory(
+        mut self,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Self {
+        self.location_generator_factory = Some(location_generator_factory);
         self
     }
 
@@ -186,6 +216,9 @@ impl CatalogLoader<'_> {
         if let Some(kms_client_factory) = self.kms_client_factory {
             builder = builder.with_kms_client_factory(kms_client_factory);
         }
+        if let Some(location_generator_factory) = self.location_generator_factory {
+            builder = builder.with_location_generator_factory(location_generator_factory);
+        }
         if let Some(runtime) = self.runtime {
             builder = builder.with_runtime(runtime);
         }
@@ -201,6 +234,9 @@ mod tests {
     use iceberg::encryption::kms::{KmsClientFactory, MemoryKmsClientFactory};
     use iceberg::io::{LocalFsStorageFactory, StorageFactory};
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
+    use iceberg::writer::file_writer::location_generator::{
+        LocationGeneratorFactory, ResolvingLocationGeneratorFactory,
+    };
     use iceberg::{CatalogBuilder, Result, Runtime};
     use sqlx::migrate::MigrateDatabase;
     use tempfile::TempDir;
@@ -377,6 +413,7 @@ mod tests {
     struct Recorded {
         storage_factory: Option<Arc<dyn StorageFactory>>,
         kms_client_factory: Option<Arc<dyn KmsClientFactory>>,
+        location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
         runtime: Option<Runtime>,
     }
 
@@ -396,6 +433,15 @@ mod tests {
 
         fn with_kms_client_factory(self, kms_client_factory: Arc<dyn KmsClientFactory>) -> Self {
             self.recorded.lock().unwrap().kms_client_factory = Some(kms_client_factory);
+            self
+        }
+
+        fn with_location_generator_factory(
+            self,
+            location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+        ) -> Self {
+            self.recorded.lock().unwrap().location_generator_factory =
+                Some(location_generator_factory);
             self
         }
 
@@ -476,11 +522,14 @@ mod tests {
         let storage_factory: Arc<dyn StorageFactory> = Arc::new(LocalFsStorageFactory);
         let kms_client_factory: Arc<dyn KmsClientFactory> =
             Arc::new(MemoryKmsClientFactory::default());
+        let location_generator_factory: Arc<dyn LocationGeneratorFactory> =
+            Arc::new(ResolvingLocationGeneratorFactory);
         let (builder, recorded) = recording_builder();
 
         CatalogLoader::from("memory")
             .with_storage_factory(storage_factory.clone())
             .with_kms_client_factory(kms_client_factory.clone())
+            .with_location_generator_factory(location_generator_factory.clone())
             .with_runtime(Runtime::new(&tokio_runtime))
             .configure(builder);
 
@@ -492,6 +541,10 @@ mod tests {
         assert!(Arc::ptr_eq(
             &recorded.kms_client_factory.unwrap(),
             &kms_client_factory
+        ));
+        assert!(Arc::ptr_eq(
+            &recorded.location_generator_factory.unwrap(),
+            &location_generator_factory
         ));
         tokio_runtime.block_on(assert_spawns_on_named_runtime(&recorded.runtime.unwrap()));
     }
@@ -505,6 +558,7 @@ mod tests {
         assert!(matches!(*recorded.lock().unwrap(), Recorded {
             storage_factory: None,
             kms_client_factory: None,
+            location_generator_factory: None,
             runtime: None,
         }));
     }

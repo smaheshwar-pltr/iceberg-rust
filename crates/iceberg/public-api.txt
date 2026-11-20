@@ -1261,6 +1261,7 @@ impl iceberg::CatalogBuilder for iceberg::memory::MemoryCatalogBuilder
 pub type iceberg::memory::MemoryCatalogBuilder::C = iceberg::memory::MemoryCatalog
 pub fn iceberg::memory::MemoryCatalogBuilder::load(self, name: impl core::convert::Into<alloc::string::String>, props: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> impl core::future::future::Future<Output = iceberg::Result<Self::C>> + core::marker::Send
 pub fn iceberg::memory::MemoryCatalogBuilder::with_kms_client_factory(self, kms_client_factory: alloc::sync::Arc<dyn iceberg::encryption::kms::KmsClientFactory>) -> Self
+pub fn iceberg::memory::MemoryCatalogBuilder::with_location_generator_factory(self, location_generator_factory: alloc::sync::Arc<dyn iceberg::writer::file_writer::location_generator::LocationGeneratorFactory>) -> Self
 pub fn iceberg::memory::MemoryCatalogBuilder::with_runtime(self, runtime: iceberg::Runtime) -> Self
 pub fn iceberg::memory::MemoryCatalogBuilder::with_storage_factory(self, storage_factory: alloc::sync::Arc<dyn iceberg::io::StorageFactory>) -> Self
 pub const iceberg::memory::MEMORY_CATALOG_WAREHOUSE: &str
@@ -4268,12 +4269,14 @@ pub trait iceberg::CatalogBuilder: core::default::Default + core::fmt::Debug + c
 pub type iceberg::CatalogBuilder::C: iceberg::Catalog
 pub fn iceberg::CatalogBuilder::load(self, name: impl core::convert::Into<alloc::string::String>, props: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> impl core::future::future::Future<Output = iceberg::Result<Self::C>> + core::marker::Send
 pub fn iceberg::CatalogBuilder::with_kms_client_factory(self, kms_client_factory: alloc::sync::Arc<dyn iceberg::encryption::kms::KmsClientFactory>) -> Self
+pub fn iceberg::CatalogBuilder::with_location_generator_factory(self, location_generator_factory: alloc::sync::Arc<dyn iceberg::writer::file_writer::location_generator::LocationGeneratorFactory>) -> Self
 pub fn iceberg::CatalogBuilder::with_runtime(self, runtime: iceberg::Runtime) -> Self
 pub fn iceberg::CatalogBuilder::with_storage_factory(self, storage_factory: alloc::sync::Arc<dyn iceberg::io::StorageFactory>) -> Self
 impl iceberg::CatalogBuilder for iceberg::memory::MemoryCatalogBuilder
 pub type iceberg::memory::MemoryCatalogBuilder::C = iceberg::memory::MemoryCatalog
 pub fn iceberg::memory::MemoryCatalogBuilder::load(self, name: impl core::convert::Into<alloc::string::String>, props: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> impl core::future::future::Future<Output = iceberg::Result<Self::C>> + core::marker::Send
 pub fn iceberg::memory::MemoryCatalogBuilder::with_kms_client_factory(self, kms_client_factory: alloc::sync::Arc<dyn iceberg::encryption::kms::KmsClientFactory>) -> Self
+pub fn iceberg::memory::MemoryCatalogBuilder::with_location_generator_factory(self, location_generator_factory: alloc::sync::Arc<dyn iceberg::writer::file_writer::location_generator::LocationGeneratorFactory>) -> Self
 pub fn iceberg::memory::MemoryCatalogBuilder::with_runtime(self, runtime: iceberg::Runtime) -> Self
 pub fn iceberg::memory::MemoryCatalogBuilder::with_storage_factory(self, storage_factory: alloc::sync::Arc<dyn iceberg::io::StorageFactory>) -> Self
 pub trait iceberg::SessionCatalog: core::fmt::Debug + core::marker::Send + core::marker::Sync
