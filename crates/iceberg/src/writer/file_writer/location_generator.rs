@@ -217,13 +217,17 @@ impl LocationGenerator for ObjectStorageLocationGenerator {
 #[derive(Clone)]
 pub struct TableLocationGenerator {
     inner: Arc<dyn ErasedLocationGenerator>,
+    generator_type: &'static str,
 }
 
 impl TableLocationGenerator {
     /// Wraps `generator` so a [`LocationGeneratorFactory`] can return it.
-    pub fn new(generator: impl LocationGenerator) -> Self {
+    ///
+    /// Clones of the result share `generator`, without calling `G::clone`.
+    pub fn new<G: LocationGenerator>(generator: G) -> Self {
         Self {
             inner: Arc::new(generator),
+            generator_type: std::any::type_name::<G>(),
         }
     }
 }
@@ -231,7 +235,8 @@ impl TableLocationGenerator {
 impl Debug for TableLocationGenerator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TableLocationGenerator")
-            .finish_non_exhaustive()
+            .field("generator", &format_args!("{}", self.generator_type))
+            .finish()
     }
 }
 
@@ -290,7 +295,9 @@ impl<'a> LocationGeneratorContext<'a> {
 /// Creates the location generator that a table writes data files with.
 ///
 /// Set one with
-/// [`CatalogBuilder::with_location_generator_factory`](crate::CatalogBuilder::with_location_generator_factory).
+/// [`CatalogBuilder::with_location_generator_factory`](crate::CatalogBuilder::with_location_generator_factory)
+/// or
+/// [`TableBuilder::location_generator_factory`](crate::table::TableBuilder::location_generator_factory).
 /// [`Table::location_generator`](crate::table::Table::location_generator) calls
 /// [`create_location_generator`](Self::create_location_generator) on every call, with the
 /// table's current metadata.
@@ -309,7 +316,7 @@ pub trait LocationGeneratorFactory: Debug + Send + Sync {
 /// is `true`, and a [`DefaultLocationGenerator`] otherwise. It fails if a table property that
 /// determines the layout has an invalid value. Java's `write.location-provider.impl` is ignored
 /// with a warning; custom factories can honor it and delegate other tables to this one.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ResolvingLocationGeneratorFactory;
 
 impl LocationGeneratorFactory for ResolvingLocationGeneratorFactory {
@@ -326,8 +333,10 @@ impl LocationGeneratorFactory for ResolvingLocationGeneratorFactory {
                 "default"
             };
             tracing::warn!(
-                "Ignoring table property {JAVA_LOCATION_PROVIDER_IMPL}={provider}; using the \
-                 {layout} layout. Set a custom LocationGeneratorFactory to honor it."
+                "Ignoring table property {JAVA_LOCATION_PROVIDER_IMPL}={provider}: Java location \
+                 provider classes are not supported; using the {layout} layout. Use \
+                 `CatalogBuilder::with_location_generator_factory` to choose a generator for this \
+                 table."
             );
         }
         if object_storage {
@@ -443,6 +452,7 @@ pub(crate) mod test {
     use crate::test_utils::{CUSTOM_LOCATION_PROVIDER, JavaLocationProviderFactory, test_runtime};
     use crate::writer::file_writer::location_generator::{
         DefaultLocationGenerator, FileNameGenerator, ObjectStorageLocationGenerator,
+        TableLocationGenerator,
     };
     use crate::{ErrorKind, TableIdent};
 
@@ -875,6 +885,19 @@ pub(crate) mod test {
         let err = table.location_generator().unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+    }
+
+    #[test]
+    fn test_table_location_generator_debug_names_wrapped_type() {
+        let generator = TableLocationGenerator::new(DefaultLocationGenerator::with_data_location(
+            "s3://data.db/table/data".to_string(),
+        ));
+
+        assert_eq!(
+            format!("{generator:?}"),
+            "TableLocationGenerator { generator: \
+             iceberg::writer::file_writer::location_generator::DefaultLocationGenerator }"
+        );
     }
 
     #[test]

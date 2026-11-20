@@ -3041,7 +3041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_location_generator_factory_reaches_created_and_loaded_tables() {
+    async fn test_location_generator_factory_reaches_created_loaded_and_registered_tables() {
         let sql_lite_uri = format!("sqlite:{}", temp_path());
         sqlx::Sqlite::create_database(&sql_lite_uri).await.unwrap();
         let catalog = SqlCatalogBuilder::default()
@@ -3070,15 +3070,26 @@ mod tests {
             .await
             .unwrap();
         let loaded = catalog.load_table(created.identifier()).await.unwrap();
+        let registered = catalog
+            .register_table(
+                &TableIdent::new(namespace_ident, "registered".into()),
+                created.metadata_location().unwrap().to_string(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(
-            [&created, &loaded].map(|table| {
+            [&created, &loaded, &registered].map(|table| {
                 table
                     .location_generator()
                     .unwrap()
                     .generate_location(None, "test.parquet")
             }),
-            ["memory:///custom/ns.tbl/test.parquet"; 2]
+            [
+                "memory:///custom/ns.tbl/test.parquet",
+                "memory:///custom/ns.tbl/test.parquet",
+                "memory:///custom/ns.registered/test.parquet",
+            ]
         );
     }
 }

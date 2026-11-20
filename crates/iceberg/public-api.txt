@@ -3464,6 +3464,8 @@ pub fn iceberg::writer::file_writer::location_generator::ObjectStorageLocationGe
 impl iceberg::writer::file_writer::location_generator::LocationGenerator for iceberg::writer::file_writer::location_generator::ObjectStorageLocationGenerator
 pub fn iceberg::writer::file_writer::location_generator::ObjectStorageLocationGenerator::generate_location(&self, partition_key: core::option::Option<&iceberg::spec::PartitionKey>, file_name: &str) -> alloc::string::String
 pub struct iceberg::writer::file_writer::location_generator::ResolvingLocationGeneratorFactory
+impl core::clone::Clone for iceberg::writer::file_writer::location_generator::ResolvingLocationGeneratorFactory
+pub fn iceberg::writer::file_writer::location_generator::ResolvingLocationGeneratorFactory::clone(&self) -> iceberg::writer::file_writer::location_generator::ResolvingLocationGeneratorFactory
 impl core::default::Default for iceberg::writer::file_writer::location_generator::ResolvingLocationGeneratorFactory
 pub fn iceberg::writer::file_writer::location_generator::ResolvingLocationGeneratorFactory::default() -> iceberg::writer::file_writer::location_generator::ResolvingLocationGeneratorFactory
 impl core::fmt::Debug for iceberg::writer::file_writer::location_generator::ResolvingLocationGeneratorFactory
@@ -3472,7 +3474,7 @@ impl iceberg::writer::file_writer::location_generator::LocationGeneratorFactory 
 pub fn iceberg::writer::file_writer::location_generator::ResolvingLocationGeneratorFactory::create_location_generator(&self, context: &iceberg::writer::file_writer::location_generator::LocationGeneratorContext<'_>) -> iceberg::Result<iceberg::writer::file_writer::location_generator::TableLocationGenerator>
 pub struct iceberg::writer::file_writer::location_generator::TableLocationGenerator
 impl iceberg::writer::file_writer::location_generator::TableLocationGenerator
-pub fn iceberg::writer::file_writer::location_generator::TableLocationGenerator::new(generator: impl iceberg::writer::file_writer::location_generator::LocationGenerator) -> Self
+pub fn iceberg::writer::file_writer::location_generator::TableLocationGenerator::new<G: iceberg::writer::file_writer::location_generator::LocationGenerator>(generator: G) -> Self
 impl core::clone::Clone for iceberg::writer::file_writer::location_generator::TableLocationGenerator
 pub fn iceberg::writer::file_writer::location_generator::TableLocationGenerator::clone(&self) -> iceberg::writer::file_writer::location_generator::TableLocationGenerator
 impl core::fmt::Debug for iceberg::writer::file_writer::location_generator::TableLocationGenerator

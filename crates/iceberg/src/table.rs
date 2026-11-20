@@ -341,7 +341,7 @@ impl Table {
     /// Creates a location generator for this table with its [`LocationGeneratorFactory`].
     ///
     /// Tables use [`ResolvingLocationGeneratorFactory`] unless their catalog or
-    /// [`TableBuilder::location_generator_factory`] set another factory.
+    /// [`TableBuilder::location_generator_factory`] sets another factory.
     ///
     /// # Errors
     ///

@@ -2157,30 +2157,53 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    /// Table properties that select [`CUSTOM_LOCATION_PROVIDER`].
+    fn custom_location_provider_properties() -> HashMap<String, String> {
+        HashMap::from([(
+            JAVA_LOCATION_PROVIDER_IMPL.to_string(),
+            CUSTOM_LOCATION_PROVIDER.to_string(),
+        )])
+    }
+
     #[tokio::test]
-    async fn test_location_generator_factory_reaches_created_and_loaded_tables() {
+    async fn test_location_generator_factory_reaches_created_loaded_and_registered_tables() {
         let catalog = new_custom_location_catalog().await;
-        let created = create_table_with_properties(
-            &catalog,
-            HashMap::from([(
-                JAVA_LOCATION_PROVIDER_IMPL.to_string(),
-                CUSTOM_LOCATION_PROVIDER.to_string(),
-            )]),
-        )
-        .await;
+        let created =
+            create_table_with_properties(&catalog, custom_location_provider_properties()).await;
         let loaded = catalog.load_table(created.identifier()).await.unwrap();
+        let registered = catalog
+            .register_table(
+                &TableIdent::new(
+                    created.identifier().namespace().clone(),
+                    "registered".into(),
+                ),
+                created.metadata_location().unwrap().to_string(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(
-            [&created, &loaded].map(|table| {
+            [&created, &loaded, &registered].map(|table| {
                 table
                     .location_generator()
                     .unwrap()
                     .generate_location(None, "test.parquet")
             }),
-            ["memory:///custom/abc/test/test.parquet"; 2]
+            [
+                "memory:///custom/abc/test/test.parquet",
+                "memory:///custom/abc/test/test.parquet",
+                "memory:///custom/abc/registered/test.parquet",
+            ]
         );
+    }
 
-        let schema = loaded.metadata().current_schema().clone();
+    #[tokio::test]
+    async fn test_data_file_writer_writes_to_factory_location() {
+        let catalog = new_custom_location_catalog().await;
+        let table =
+            create_table_with_properties(&catalog, custom_location_provider_properties()).await;
+
+        let schema = table.metadata().current_schema().clone();
         let batch = RecordBatch::try_new(Arc::new(schema_to_arrow_schema(&schema).unwrap()), vec![
             Arc::new(Int32Array::from(vec![1])),
         ])
@@ -2188,8 +2211,8 @@ pub(crate) mod tests {
         let mut writer =
             DataFileWriterBuilder::new(RollingFileWriterBuilder::new_with_default_file_size(
                 ParquetWriterBuilder::new(WriterProperties::default(), schema),
-                loaded.file_io().clone(),
-                loaded.location_generator().unwrap(),
+                table.file_io().clone(),
+                table.location_generator().unwrap(),
                 DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet),
             ))
             .build(None)
@@ -2203,7 +2226,7 @@ pub(crate) mod tests {
             .map(|data_file| data_file.file_path())
             .collect_vec();
         assert_eq!(paths, ["memory:///custom/abc/test/test-00000.parquet"]);
-        assert!(loaded.file_io().exists(paths[0]).await.unwrap());
+        assert!(table.file_io().exists(paths[0]).await.unwrap());
     }
 
     #[tokio::test]
