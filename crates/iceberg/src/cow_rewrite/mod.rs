@@ -84,7 +84,6 @@ use crate::expr::Predicate;
 use crate::scan::FileScanTaskStream;
 use crate::spec::{DataFile, PartitionKey};
 use crate::table::Table;
-use crate::writer::file_writer::location_generator::TableLocationGenerator;
 use crate::{Error, ErrorKind, Result};
 
 /// Counters produced by a copy-on-write rewrite.
@@ -224,8 +223,6 @@ impl<'a> CowRewriteBuilder<'a> {
             ..CowRewriteResult::default()
         };
 
-        // Created on the first changed file and shared by every replacement writer.
-        let mut location_generator = None;
         for file in files {
             let CowRewriteFile {
                 old_data_file,
@@ -314,16 +311,9 @@ impl<'a> CowRewriteBuilder<'a> {
                 {
                     let partition_key =
                         source_partition_key(self.table, &old_data_file, &write_schema)?;
-                    let file_location_generator = match location_generator.as_ref() {
-                        Some(generator) => TableLocationGenerator::clone(generator),
-                        None => location_generator
-                            .insert(self.table.location_generator()?)
-                            .clone(),
-                    };
                     writer = Some(
                         writer::build_replacement_writer(
                             self.table,
-                            file_location_generator,
                             write_schema.clone(),
                             Some(partition_key),
                         )

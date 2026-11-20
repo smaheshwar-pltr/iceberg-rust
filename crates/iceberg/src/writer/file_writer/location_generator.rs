@@ -51,8 +51,6 @@ const HASH_BINARY_STRING_BITS: usize = 20;
 const ENTROPY_DIR_LENGTH: usize = 4;
 /// Number of entropy directories generated from the hash.
 const ENTROPY_DIR_DEPTH: usize = 3;
-/// Java's table property naming a custom location provider class.
-pub(crate) const JAVA_LOCATION_PROVIDER_IMPL: &str = "write.location-provider.impl";
 
 #[derive(Clone, Debug)]
 /// `DefaultLocationGenerator` used to generate the data dir location of data file.
@@ -314,8 +312,10 @@ pub trait LocationGeneratorFactory: Debug + Send + Sync {
 /// It creates an [`ObjectStorageLocationGenerator`] when
 /// [`write.object-storage.enabled`](crate::spec::TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED)
 /// is `true`, and a [`DefaultLocationGenerator`] otherwise. It fails if a table property that
-/// determines the layout has an invalid value. Java's `write.location-provider.impl` is ignored
-/// with a warning; custom factories can honor it and delegate other tables to this one.
+/// determines the layout has an invalid value. Java's `write.location-provider.impl` is ignored;
+/// a custom factory set with
+/// [`CatalogBuilder::with_location_generator_factory`](crate::CatalogBuilder::with_location_generator_factory)
+/// can honor it and delegate other tables to this one.
 #[derive(Clone, Debug, Default)]
 pub struct ResolvingLocationGeneratorFactory;
 
@@ -325,21 +325,9 @@ impl LocationGeneratorFactory for ResolvingLocationGeneratorFactory {
         context: &LocationGeneratorContext<'_>,
     ) -> Result<TableLocationGenerator> {
         let metadata = context.metadata();
-        let object_storage = metadata.table_properties().write_object_storage_enabled()?;
-        if let Some(provider) = metadata.properties().get(JAVA_LOCATION_PROVIDER_IMPL) {
-            let layout = if object_storage {
-                "object storage"
-            } else {
-                "default"
-            };
-            tracing::warn!(
-                "Ignoring table property {JAVA_LOCATION_PROVIDER_IMPL}={provider}: Java location \
-                 provider classes are not supported; using the {layout} layout. Use \
-                 `CatalogBuilder::with_location_generator_factory` to choose a generator for this \
-                 table."
-            );
-        }
-        if object_storage {
+        // TODO: Warn when write.location-provider.impl is set. Callers may create a
+        // generator per file, so avoid flooding the logs.
+        if metadata.table_properties().write_object_storage_enabled()? {
             Ok(TableLocationGenerator::new(
                 ObjectStorageLocationGenerator::new(metadata)?,
             ))
@@ -442,14 +430,17 @@ pub(crate) mod test {
     use rstest::rstest;
     use uuid::Uuid;
 
-    use super::{JAVA_LOCATION_PROVIDER_IMPL, LocationGenerator};
+    use super::LocationGenerator;
     use crate::io::FileIO;
     use crate::spec::{
         FormatVersion, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
         Struct, StructType, TableMetadata, TableProperties, Transform, Type,
     };
     use crate::table::{Table, TableBuilder};
-    use crate::test_utils::{CUSTOM_LOCATION_PROVIDER, JavaLocationProviderFactory, test_runtime};
+    use crate::test_utils::{
+        CUSTOM_LOCATION_PROVIDER, JAVA_LOCATION_PROVIDER_IMPL, JavaLocationProviderFactory,
+        test_runtime,
+    };
     use crate::writer::file_writer::location_generator::{
         DefaultLocationGenerator, FileNameGenerator, ObjectStorageLocationGenerator,
         TableLocationGenerator,
@@ -772,7 +763,7 @@ pub(crate) mod test {
         "s3://data.db/table/data/test.parquet",
         "s3://data.db/table/data/data%231=val%231/test.parquet",
     ])]
-    #[case::java_location_provider(&[(JAVA_LOCATION_PROVIDER_IMPL, "com.example.Provider")], [
+    #[case::java_location_provider(&[("write.location-provider.impl", "com.example.Provider")], [
         "s3://data.db/table/data/test.parquet",
         "s3://data.db/table/data/data%231=val%231/test.parquet",
     ])]

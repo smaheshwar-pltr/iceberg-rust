@@ -468,12 +468,15 @@ pub(crate) mod tests {
     use crate::spec::{
         DataFileFormat, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type,
     };
-    use crate::test_utils::{CUSTOM_LOCATION_PROVIDER, JavaLocationProviderFactory, test_runtime};
+    use crate::test_utils::{
+        CUSTOM_LOCATION_PROVIDER, JAVA_LOCATION_PROVIDER_IMPL, JavaLocationProviderFactory,
+        test_runtime,
+    };
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
     use crate::writer::file_writer::ParquetWriterBuilder;
     use crate::writer::file_writer::location_generator::{
-        DefaultFileNameGenerator, JAVA_LOCATION_PROVIDER_IMPL, LocationGenerator,
+        DefaultFileNameGenerator, LocationGenerator,
     };
     use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};

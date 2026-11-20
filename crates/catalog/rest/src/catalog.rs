@@ -1746,10 +1746,6 @@ mod tests {
         UnboundPartitionField, UnboundPartitionSpec,
     };
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
-    use iceberg::writer::file_writer::location_generator::{
-        DefaultLocationGenerator, LocationGenerator, LocationGeneratorContext,
-        TableLocationGenerator,
-    };
     use iceberg_test_utils::test_runtime;
     use mockito::{Mock, Server, ServerGuard};
     use serde_json::json;

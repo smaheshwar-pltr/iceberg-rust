@@ -27,9 +27,7 @@ use crate::table::Table;
 use crate::writer::IcebergWriterBuilder;
 use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use crate::writer::file_writer::ParquetWriterBuilder;
-use crate::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, TableLocationGenerator,
-};
+use crate::writer::file_writer::location_generator::DefaultFileNameGenerator;
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 
 /// Builds a boxed replacement-data-file writer.
@@ -43,10 +41,10 @@ use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 /// batch is written, so it is safe to construct one optimistically and only
 /// write to it once a source file is known to have changed.
 ///
-/// `location_generator` is the table's [`Table::location_generator`].
+/// File locations follow the layout selected by the table properties; see
+/// [`Table::location_generator`].
 pub(crate) async fn build_replacement_writer(
     table: &Table,
-    location_generator: TableLocationGenerator,
     write_schema: SchemaRef,
     partition_key: Option<PartitionKey>,
 ) -> Result<Box<dyn crate::writer::IcebergWriter>> {
@@ -70,6 +68,7 @@ pub(crate) async fn build_replacement_writer(
         parquet_builder = parquet_builder.with_encryption_manager(encryption_manager.clone());
     }
 
+    let location_generator = table.location_generator()?;
     let file_name_generator = DefaultFileNameGenerator::new(
         format!("cow-rewrite-{}", Uuid::now_v7()),
         None,
@@ -103,13 +102,7 @@ where
 {
     use futures::TryStreamExt as _;
 
-    let mut writer = build_replacement_writer(
-        table,
-        table.location_generator()?,
-        write_schema,
-        partition_key,
-    )
-    .await?;
+    let mut writer = build_replacement_writer(table, write_schema, partition_key).await?;
 
     let mut wrote_rows = false;
     while let Some(batch) = batches.try_next().await? {

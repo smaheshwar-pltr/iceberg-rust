@@ -19,10 +19,13 @@
 
 use crate::spec::PartitionKey;
 use crate::writer::file_writer::location_generator::{
-    JAVA_LOCATION_PROVIDER_IMPL, LocationGenerator, LocationGeneratorContext,
-    LocationGeneratorFactory, ResolvingLocationGeneratorFactory, TableLocationGenerator,
+    LocationGenerator, LocationGeneratorContext, LocationGeneratorFactory,
+    ResolvingLocationGeneratorFactory, TableLocationGenerator,
 };
 use crate::{Error, ErrorKind, Result};
+
+/// Java's table property naming a custom location provider class.
+pub(crate) const JAVA_LOCATION_PROVIDER_IMPL: &str = "write.location-provider.impl";
 
 /// The Java location provider class that [`JavaLocationProviderFactory`] supports.
 pub(crate) const CUSTOM_LOCATION_PROVIDER: &str = "org.example.CustomLocationProvider";
