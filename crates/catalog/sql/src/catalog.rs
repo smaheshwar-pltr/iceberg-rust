@@ -25,6 +25,7 @@ use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
+use iceberg::writer::file_writer::location_generator::LocationGeneratorFactory;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
     Runtime, TableCommit, TableCreation, TableIdent, delete_removed_metadata_files,
@@ -100,6 +101,7 @@ pub struct SqlCatalogBuilder {
     props: HashMap<String, String>,
     storage_factory: Option<Arc<dyn StorageFactory>>,
     kms_client_factory: Option<Arc<dyn KmsClientFactory>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     runtime: Option<Runtime>,
 }
 
@@ -173,6 +175,14 @@ impl CatalogBuilder for SqlCatalogBuilder {
         self
     }
 
+    fn with_location_generator_factory(
+        mut self,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Self {
+        self.location_generator_factory = Some(location_generator_factory);
+        self
+    }
+
     fn with_runtime(mut self, runtime: Runtime) -> Self {
         self.runtime = Some(runtime);
         self
@@ -224,6 +234,7 @@ impl CatalogBuilder for SqlCatalogBuilder {
                 self.storage_factory,
                 runtime,
                 kms_client,
+                self.location_generator_factory,
             )
             .await
         }
@@ -322,6 +333,7 @@ pub struct SqlCatalog {
     fileio: FileIO,
     runtime: Runtime,
     kms_client: Option<Arc<dyn KeyManagementClient>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     schema_version: SchemaVersion,
 }
 
@@ -402,6 +414,7 @@ impl SqlCatalog {
         storage_factory: Option<Arc<dyn StorageFactory>>,
         runtime: Runtime,
         kms_client: Option<Arc<dyn KeyManagementClient>>,
+        location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     ) -> Result<Self> {
         let factory = storage_factory.ok_or_else(|| {
             Error::new(
@@ -501,6 +514,7 @@ impl SqlCatalog {
             fileio,
             runtime,
             kms_client,
+            location_generator_factory,
             schema_version,
         })
     }
@@ -1003,6 +1017,9 @@ impl Catalog for SqlCatalog {
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
         }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(location_generator_factory);
+        }
         Ok(builder.build()?)
     }
 
@@ -1081,6 +1098,9 @@ impl Catalog for SqlCatalog {
             .runtime(self.runtime.clone());
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
+        }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(location_generator_factory);
         }
         Ok(builder.build()?)
     }
@@ -1165,6 +1185,9 @@ impl Catalog for SqlCatalog {
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
         }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(location_generator_factory);
+        }
         Ok(builder.build()?)
     }
 
@@ -1237,8 +1260,13 @@ mod tests {
     use iceberg::io::LocalFsStorageFactory;
     use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, Type};
     use iceberg::table::Table;
+    use iceberg::writer::file_writer::location_generator::{
+        DefaultLocationGenerator, LocationGenerator, LocationGeneratorContext,
+        LocationGeneratorFactory,
+    };
     use iceberg::{
-        Catalog, CatalogBuilder, ErrorKind, Namespace, NamespaceIdent, TableCreation, TableIdent,
+        Catalog, CatalogBuilder, ErrorKind, Namespace, NamespaceIdent, Result, TableCreation,
+        TableIdent,
     };
     use itertools::Itertools;
     use regex::Regex;
@@ -3001,5 +3029,72 @@ mod tests {
             .expect("legacy sql_bind_style key should still be accepted");
 
         assert_eq!(catalog.properties.sql_bind_style, SqlBindStyle::QMark);
+    }
+
+    #[tokio::test]
+    async fn test_created_loaded_and_registered_tables_use_location_generator_factory() {
+        #[derive(Debug)]
+        struct TenantLocationGeneratorFactory;
+
+        impl LocationGeneratorFactory for TenantLocationGeneratorFactory {
+            fn create_location_generator(
+                &self,
+                context: &LocationGeneratorContext<'_>,
+            ) -> Result<Arc<dyn LocationGenerator>> {
+                Ok(Arc::new(DefaultLocationGenerator::with_data_location(
+                    format!("file:///tenant-data/{}", context.identifier()),
+                )))
+            }
+        }
+
+        let sql_lite_uri = format!("sqlite:{}", temp_path());
+        sqlx::Sqlite::create_database(&sql_lite_uri).await.unwrap();
+        let catalog = SqlCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .with_location_generator_factory(Arc::new(TenantLocationGeneratorFactory))
+            .load(
+                "iceberg",
+                HashMap::from([
+                    (SQL_CATALOG_PROP_URI.to_string(), sql_lite_uri),
+                    (SQL_CATALOG_PROP_WAREHOUSE.to_string(), temp_path()),
+                ]),
+            )
+            .await
+            .unwrap();
+        let namespace_ident = NamespaceIdent::new("ns".into());
+        create_namespace(&catalog, &namespace_ident).await;
+
+        let created = catalog
+            .create_table(
+                &namespace_ident,
+                TableCreation::builder()
+                    .name("t".into())
+                    .schema(simple_table_schema())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let loaded = catalog.load_table(created.identifier()).await.unwrap();
+        let registered = catalog
+            .register_table(
+                &TableIdent::new(namespace_ident, "registered".into()),
+                created.metadata_location().unwrap().to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            [created, loaded, registered].map(|table| {
+                table
+                    .location_generator()
+                    .unwrap()
+                    .generate_location(None, "data.parquet")
+            }),
+            [
+                "file:///tenant-data/ns.t/data.parquet",
+                "file:///tenant-data/ns.t/data.parquet",
+                "file:///tenant-data/ns.registered/data.parquet",
+            ]
+        );
     }
 }

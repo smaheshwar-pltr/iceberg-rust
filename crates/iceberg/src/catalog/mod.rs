@@ -51,6 +51,7 @@ use crate::spec::{
     UnboundPartitionSpec, ViewFormatVersion, ViewRepresentations, ViewVersion,
 };
 use crate::table::Table;
+use crate::writer::file_writer::location_generator::LocationGeneratorFactory;
 use crate::{Error, ErrorKind, Result};
 
 /// The catalog API for Iceberg Rust.
@@ -177,6 +178,17 @@ pub trait CatalogBuilder: Default + Debug + Send + Sync {
     ///     .await?;
     /// ```
     fn with_kms_client_factory(self, kms_client_factory: Arc<dyn KmsClientFactory>) -> Self;
+
+    /// Set the [`LocationGeneratorFactory`] that creates location generators for this catalog's
+    /// tables.
+    ///
+    /// The catalog passes the factory to the `TableBuilder` of every table it returns, and
+    /// [`Table::location_generator`] calls it. Without one, tables use
+    /// [`ResolvingLocationGeneratorFactory`](crate::writer::file_writer::location_generator::ResolvingLocationGeneratorFactory).
+    fn with_location_generator_factory(
+        self,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Self;
 
     /// Set a custom tokio Runtime to use for spawning async tasks.
     ///

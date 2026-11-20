@@ -312,6 +312,7 @@ impl iceberg::catalog::CatalogBuilder for iceberg_catalog_rest::RestCatalogBuild
 pub type iceberg_catalog_rest::RestCatalogBuilder::C = iceberg_catalog_rest::RestCatalog
 pub fn iceberg_catalog_rest::RestCatalogBuilder::load(self, name: impl core::convert::Into<alloc::string::String>, props: std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> impl core::future::future::Future<Output = iceberg::error::Result<Self::C>> + core::marker::Send
 pub fn iceberg_catalog_rest::RestCatalogBuilder::with_kms_client_factory(self, kms_client_factory: alloc::sync::Arc<dyn iceberg::encryption::kms::factory::KmsClientFactory>) -> Self
+pub fn iceberg_catalog_rest::RestCatalogBuilder::with_location_generator_factory(self, location_generator_factory: alloc::sync::Arc<dyn iceberg::writer::file_writer::location_generator::LocationGeneratorFactory>) -> Self
 pub fn iceberg_catalog_rest::RestCatalogBuilder::with_runtime(self, runtime: iceberg::runtime::Runtime) -> Self
 pub fn iceberg_catalog_rest::RestCatalogBuilder::with_storage_factory(self, storage_factory: alloc::sync::Arc<dyn iceberg::io::storage::StorageFactory>) -> Self
 pub struct iceberg_catalog_rest::RestSessionCatalog
@@ -339,6 +340,7 @@ pub fn iceberg_catalog_rest::RestSessionCatalogBuilder::load(self, name: impl co
 pub fn iceberg_catalog_rest::RestSessionCatalogBuilder::with_auth_manager<M>(self, auth_manager: M) -> Self where M: iceberg_catalog_rest::AuthManager + 'static
 pub fn iceberg_catalog_rest::RestSessionCatalogBuilder::with_client(self, client: reqwest::async_impl::client::Client) -> Self
 pub fn iceberg_catalog_rest::RestSessionCatalogBuilder::with_kms_client_factory(self, kms_client_factory: alloc::sync::Arc<dyn iceberg::encryption::kms::factory::KmsClientFactory>) -> Self
+pub fn iceberg_catalog_rest::RestSessionCatalogBuilder::with_location_generator_factory(self, location_generator_factory: alloc::sync::Arc<dyn iceberg::writer::file_writer::location_generator::LocationGeneratorFactory>) -> Self
 pub fn iceberg_catalog_rest::RestSessionCatalogBuilder::with_page_size(self, page_size: core::num::nonzero::NonZeroU32) -> Self
 pub fn iceberg_catalog_rest::RestSessionCatalogBuilder::with_runtime(self, runtime: iceberg::runtime::Runtime) -> Self
 pub fn iceberg_catalog_rest::RestSessionCatalogBuilder::with_storage_factory(self, storage_factory: alloc::sync::Arc<dyn iceberg::io::storage::StorageFactory>) -> Self

@@ -31,6 +31,7 @@ use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
+use iceberg::writer::file_writer::location_generator::LocationGeneratorFactory;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace, NamespaceIdent, Result,
     Runtime, TableCommit, TableCreation, TableIdent,
@@ -73,6 +74,7 @@ pub struct S3TablesCatalogBuilder {
     config: S3TablesCatalogConfig,
     storage_factory: Option<Arc<dyn StorageFactory>>,
     kms_client_factory: Option<Arc<dyn KmsClientFactory>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     runtime: Option<Runtime>,
 }
 
@@ -89,6 +91,7 @@ impl Default for S3TablesCatalogBuilder {
             },
             storage_factory: None,
             kms_client_factory: None,
+            location_generator_factory: None,
             runtime: None,
         }
     }
@@ -139,6 +142,14 @@ impl CatalogBuilder for S3TablesCatalogBuilder {
 
     fn with_kms_client_factory(mut self, kms_client_factory: Arc<dyn KmsClientFactory>) -> Self {
         self.kms_client_factory = Some(kms_client_factory);
+        self
+    }
+
+    fn with_location_generator_factory(
+        mut self,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Self {
+        self.location_generator_factory = Some(location_generator_factory);
         self
     }
 
@@ -195,7 +206,14 @@ impl CatalogBuilder for S3TablesCatalogBuilder {
                     Some(factory) => Some(factory.create_kms_client(&self.config.props).await?),
                     None => None,
                 };
-                S3TablesCatalog::new(self.config, self.storage_factory, runtime, kms_client).await
+                S3TablesCatalog::new(
+                    self.config,
+                    self.storage_factory,
+                    runtime,
+                    kms_client,
+                    self.location_generator_factory,
+                )
+                .await
             }
         }
     }
@@ -209,6 +227,7 @@ pub struct S3TablesCatalog {
     file_io: FileIO,
     runtime: Runtime,
     kms_client: Option<Arc<dyn KeyManagementClient>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
 }
 
 impl S3TablesCatalog {
@@ -218,6 +237,7 @@ impl S3TablesCatalog {
         storage_factory: Option<Arc<dyn StorageFactory>>,
         runtime: Runtime,
         kms_client: Option<Arc<dyn KeyManagementClient>>,
+        location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     ) -> Result<Self> {
         let s3tables_client = if let Some(client) = config.client.clone() {
             client
@@ -242,6 +262,7 @@ impl S3TablesCatalog {
             file_io,
             runtime,
             kms_client,
+            location_generator_factory,
         })
     }
 
@@ -293,6 +314,9 @@ impl S3TablesCatalog {
             .runtime(self.runtime.clone());
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
+        }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(location_generator_factory);
         }
         let table = builder.build()?;
         Ok((table, resp.version_token))
@@ -596,6 +620,9 @@ impl Catalog for S3TablesCatalog {
         if let Some(kms_client) = self.kms_client.clone() {
             builder = builder.kms_client(kms_client);
         }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            builder = builder.location_generator_factory(location_generator_factory);
+        }
         let table = builder.build()?;
         Ok(table)
     }
@@ -796,7 +823,7 @@ mod tests {
         };
 
         Ok(Some(
-            S3TablesCatalog::new(config, None, Runtime::current(), None).await?,
+            S3TablesCatalog::new(config, None, Runtime::current(), None, None).await?,
         ))
     }
 

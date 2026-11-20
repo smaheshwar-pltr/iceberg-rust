@@ -31,6 +31,7 @@ use iceberg::io::{
     ADLS_SAS_TOKEN, FileIO, FileIOBuilder, GCS_TOKEN, S3_SESSION_TOKEN, StorageFactory,
 };
 use iceberg::table::Table;
+use iceberg::writer::file_writer::location_generator::LocationGeneratorFactory;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime,
     SessionCatalog, SessionContext, TableCommit, TableCreation, TableIdent,
@@ -124,6 +125,16 @@ impl CatalogBuilder for RestCatalogBuilder {
 
     fn with_kms_client_factory(mut self, kms_client_factory: Arc<dyn KmsClientFactory>) -> Self {
         self.inner = self.inner.with_kms_client_factory(kms_client_factory);
+        self
+    }
+
+    fn with_location_generator_factory(
+        mut self,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Self {
+        self.inner = self
+            .inner
+            .with_location_generator_factory(location_generator_factory);
         self
     }
 
@@ -694,6 +705,7 @@ impl RestCatalog {
             storage_factory,
             runtime,
             kms_client,
+            None,
         ));
 
         Self::from_session_catalog(context, session_catalog)
@@ -838,6 +850,7 @@ pub struct RestSessionCatalog {
     runtime: Runtime,
     /// Optional KMS client for encrypted tables.
     kms_client: Option<Arc<dyn KeyManagementClient>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
 }
 
 impl RestSessionCatalog {
@@ -848,6 +861,7 @@ impl RestSessionCatalog {
         storage_factory: Option<Arc<dyn StorageFactory>>,
         runtime: Runtime,
         kms_client: Option<Arc<dyn KeyManagementClient>>,
+        location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     ) -> Self {
         Self {
             auth_manager_override: auth_manager_override.map(Arc::from),
@@ -856,6 +870,7 @@ impl RestSessionCatalog {
             storage_factory,
             runtime,
             kms_client,
+            location_generator_factory,
         }
     }
 
@@ -1353,6 +1368,9 @@ impl SessionCatalog for RestSessionCatalog {
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
         }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            table_builder = table_builder.location_generator_factory(location_generator_factory);
+        }
 
         if let Some(metadata_location) = response.metadata_location {
             table_builder.metadata_location(metadata_location).build()
@@ -1449,6 +1467,9 @@ impl SessionCatalog for RestSessionCatalog {
             .runtime(self.runtime.clone());
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
+        }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            table_builder = table_builder.location_generator_factory(location_generator_factory);
         }
 
         let table = if let Some(metadata_location) = response.metadata_location {
@@ -1601,6 +1622,9 @@ impl SessionCatalog for RestSessionCatalog {
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
         }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            table_builder = table_builder.location_generator_factory(location_generator_factory);
+        }
         table_builder.build()
     }
 
@@ -1682,6 +1706,9 @@ impl SessionCatalog for RestSessionCatalog {
         if let Some(kms_client) = self.kms_client.clone() {
             table_builder = table_builder.kms_client(kms_client);
         }
+        if let Some(location_generator_factory) = self.location_generator_factory.clone() {
+            table_builder = table_builder.location_generator_factory(location_generator_factory);
+        }
         table_builder.build()
     }
 }
@@ -1696,6 +1723,7 @@ pub struct RestSessionCatalogBuilder {
     auth_manager: Option<Box<dyn AuthManager>>,
     storage_factory: Option<Arc<dyn StorageFactory>>,
     kms_client_factory: Option<Arc<dyn KmsClientFactory>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     runtime: Option<Runtime>,
 }
 
@@ -1713,6 +1741,7 @@ impl Default for RestSessionCatalogBuilder {
             auth_manager: None,
             storage_factory: None,
             kms_client_factory: None,
+            location_generator_factory: None,
             runtime: None,
         }
     }
@@ -1807,6 +1836,16 @@ impl RestSessionCatalogBuilder {
         self
     }
 
+    /// Set the [`LocationGeneratorFactory`] that creates location generators for this catalog's
+    /// tables; see [`CatalogBuilder::with_location_generator_factory`].
+    pub fn with_location_generator_factory(
+        mut self,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Self {
+        self.location_generator_factory = Some(location_generator_factory);
+        self
+    }
+
     /// Set a custom tokio Runtime to use for spawning async tasks.
     ///
     /// When a Runtime is provided, the catalog will propagate it to all tables
@@ -1868,6 +1907,7 @@ impl RestSessionCatalogBuilder {
                     self.storage_factory,
                     runtime,
                     kms_client,
+                    self.location_generator_factory,
                 ))
             }
         }
@@ -1888,6 +1928,9 @@ mod tests {
         UnboundPartitionField, UnboundPartitionSpec,
     };
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    use iceberg::writer::file_writer::location_generator::{
+        DefaultLocationGenerator, LocationGenerator, LocationGeneratorContext,
+    };
     use iceberg_test_utils::test_runtime;
     use mockito::{Matcher, Mock, Server, ServerGuard};
     use serde_json::json;
@@ -1967,7 +2010,7 @@ mod tests {
     }
 
     fn test_catalog(config: RestCatalogConfig) -> RestSessionCatalog {
-        RestSessionCatalog::new(config, None, None, Runtime::current(), None)
+        RestSessionCatalog::new(config, None, None, Runtime::current(), None, None)
     }
 
     fn test_catalog_with<M>(config: RestCatalogConfig, auth_manager: M) -> RestSessionCatalog
@@ -1977,6 +2020,7 @@ mod tests {
             Some(Box::new(auth_manager)),
             None,
             Runtime::current(),
+            None,
             None,
         )
     }
@@ -2011,6 +2055,7 @@ mod tests {
             None,
             Some(Arc::new(LocalFsStorageFactory)),
             Runtime::current(),
+            None,
             None,
         )
     }
@@ -4479,6 +4524,60 @@ mod tests {
 
         config_mock.assert_async().await;
         rename_table_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_loaded_table_uses_builder_location_generator_factory() {
+        #[derive(Debug)]
+        struct TenantLocationGeneratorFactory;
+
+        impl LocationGeneratorFactory for TenantLocationGeneratorFactory {
+            fn create_location_generator(
+                &self,
+                context: &LocationGeneratorContext<'_>,
+            ) -> Result<Arc<dyn LocationGenerator>> {
+                Ok(Arc::new(DefaultLocationGenerator::with_data_location(
+                    format!("s3://tenant-data/{}", context.identifier()),
+                )))
+            }
+        }
+
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let load_table_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body_from_file(format!(
+                "{}/testdata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "load_table_response.json"
+            ))
+            .create_async()
+            .await;
+        let catalog = RestCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .with_location_generator_factory(Arc::new(TenantLocationGeneratorFactory))
+            .load(
+                "test",
+                HashMap::from([(REST_CATALOG_PROP_URI.to_string(), server.url())]),
+            )
+            .await
+            .unwrap();
+
+        let table = catalog
+            .load_table(&TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            table
+                .location_generator()
+                .unwrap()
+                .generate_location(None, "data.parquet"),
+            "s3://tenant-data/ns1.test1/data.parquet"
+        );
+        config_mock.assert_async().await;
+        load_table_mock.assert_async().await;
     }
 
     /// A `loadTable` body for `ns1.test1` whose `metadata-location` names `tag`.
