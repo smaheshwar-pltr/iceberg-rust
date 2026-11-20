@@ -31,7 +31,10 @@ use crate::scan::TableScanBuilder;
 use crate::spec::{
     ManifestListReader, ManifestReader, SchemaRef, SnapshotRef, TableMetadata, TableMetadataRef,
 };
-use crate::writer::file_writer::location_generator::{LocationGenerator, table_location_generator};
+use crate::writer::file_writer::location_generator::{
+    LocationGenerator, LocationGeneratorContext, LocationGeneratorFactory,
+    ResolvingLocationGeneratorFactory,
+};
 use crate::{Result, TableIdent};
 
 /// Builder to create table scan.
@@ -41,6 +44,7 @@ pub struct TableBuilder {
     metadata: Option<TableMetadataRef>,
     identifier: Option<TableIdent>,
     kms_client: Option<Arc<dyn KeyManagementClient>>,
+    location_generator_factory: Option<Arc<dyn LocationGeneratorFactory>>,
     readonly: bool,
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
@@ -55,6 +59,7 @@ impl TableBuilder {
             metadata: None,
             identifier: None,
             kms_client: None,
+            location_generator_factory: None,
             readonly: false,
             disable_cache: false,
             cache_size_bytes: None,
@@ -122,6 +127,16 @@ impl TableBuilder {
         self
     }
 
+    /// optional - sets the factory that creates the table's location generator
+    /// (default [`ResolvingLocationGeneratorFactory`]).
+    pub fn location_generator_factory(
+        mut self,
+        location_generator_factory: Arc<dyn LocationGeneratorFactory>,
+    ) -> Self {
+        self.location_generator_factory = Some(location_generator_factory);
+        self
+    }
+
     /// build the Table
     pub fn build(self) -> Result<Table> {
         let Self {
@@ -130,6 +145,7 @@ impl TableBuilder {
             metadata,
             identifier,
             kms_client,
+            location_generator_factory,
             readonly,
             disable_cache,
             cache_size_bytes,
@@ -193,6 +209,8 @@ impl TableBuilder {
             object_cache,
             runtime,
             encryption_manager,
+            location_generator_factory: location_generator_factory
+                .unwrap_or_else(|| Arc::new(ResolvingLocationGeneratorFactory)),
         })
     }
 }
@@ -208,6 +226,7 @@ pub struct Table {
     object_cache: Arc<ObjectCache>,
     runtime: Runtime,
     encryption_manager: Option<Arc<EncryptionManager>>,
+    location_generator_factory: Arc<dyn LocationGeneratorFactory>,
 }
 
 impl Table {
@@ -336,19 +355,21 @@ impl Table {
         ArrowReaderBuilder::new(self.file_io.clone(), self.runtime().clone())
     }
 
-    /// Creates the location generator for the layout selected by the table properties.
+    /// Creates a location generator for this table's data files.
     ///
-    /// The layout follows
-    /// [`write.object-storage.enabled`](crate::spec::TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED);
-    /// see [`ObjectStorageLocationGenerator`](crate::writer::file_writer::location_generator::ObjectStorageLocationGenerator)
-    /// and [`DefaultLocationGenerator`](crate::writer::file_writer::location_generator::DefaultLocationGenerator).
-    /// Java's `write.location-provider.impl` is not supported and is ignored.
+    /// The generator comes from the table's [`LocationGeneratorFactory`], called with the
+    /// table's current metadata. The default factory, [`ResolvingLocationGeneratorFactory`],
+    /// selects the layout from the table properties.
     ///
     /// # Errors
     ///
-    /// Returns an error if a table property that determines the layout has an invalid value.
+    /// Returns an error if the factory fails to create a generator.
     pub fn location_generator(&self) -> Result<Arc<dyn LocationGenerator>> {
-        table_location_generator(self.metadata())
+        self.location_generator_factory
+            .create_location_generator(&LocationGeneratorContext::new(
+                &self.metadata,
+                &self.identifier,
+            ))
     }
 }
 
